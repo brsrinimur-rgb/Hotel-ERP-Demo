@@ -1,5 +1,17 @@
-@echo off
-cd /d "%~dp0"
-python -m pip install -r requirements.txt
-python -m streamlit run app.py
-pause
+[server]
+headless = true
+address = "0.0.0.0"
+port = 8501
+enableCORS = false
+enableXsrfProtection = true
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "light"
+primaryColor = "#FF4B4B"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F3F5F8"
+textColor = "#1F2937"
+font = "sans serif"
