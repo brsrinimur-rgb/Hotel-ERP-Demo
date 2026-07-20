@@ -1,0 +1,19 @@
+STREAMLIT DEPLOYMENT FIX
+
+1. Replace the GitHub requirements.txt file with:
+
+streamlit>=1.42,<2
+pandas>=2.2,<3
+openpyxl>=3.1,<4
+
+2. Upload runtime.txt containing:
+
+python-3.11
+
+3. Commit the changes.
+
+4. In Streamlit Cloud:
+   Manage app -> Reboot app
+
+The old requirements.txt incorrectly contained Python source code such as:
+import streamlit as st
