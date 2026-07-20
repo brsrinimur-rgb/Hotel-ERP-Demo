@@ -1,0 +1,7 @@
+PO Value Invoice Fix
+
+Fixed:
+- Supplier invoice subtotal now comes from PO quantity × PO unit cost.
+- VAT now comes from the PO VAT rate.
+- Invoice total now uses the approved PO total.
+- PO/GRN selector now displays PO number, GRN number, supplier, and PO value.
