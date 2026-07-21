@@ -19,12 +19,147 @@ st.set_page_config(
     layout="wide"
 )
 
+# ---------------- Premium UI theme ----------------
+st.markdown("""
+<style>
+:root {
+    --erp-navy: #12213f;
+    --erp-blue: #2563eb;
+    --erp-cyan: #06b6d4;
+    --erp-gold: #f59e0b;
+    --erp-bg: #f5f7fb;
+    --erp-card: #ffffff;
+    --erp-text: #172033;
+    --erp-muted: #64748b;
+}
+
+.stApp {
+    background:
+      radial-gradient(circle at 100% 0%, rgba(37,99,235,.08), transparent 24rem),
+      linear-gradient(180deg, #f8fafc 0%, var(--erp-bg) 100%);
+}
+
+[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #111d36 0%, #172b4d 55%, #0f3d56 100%);
+    border-right: 1px solid rgba(255,255,255,.08);
+}
+[data-testid="stSidebar"] * { color: #f8fafc; }
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p { color: #dbeafe; }
+[data-testid="stSidebar"] .stRadio label {
+    border-radius: 10px;
+    padding: .38rem .55rem;
+    margin: .08rem 0;
+    transition: all .18s ease;
+}
+[data-testid="stSidebar"] .stRadio label:hover {
+    background: rgba(255,255,255,.10);
+    transform: translateX(3px);
+}
+[data-testid="stSidebar"] .stButton button {
+    width: 100%;
+    background: rgba(255,255,255,.10);
+    color: #fff;
+    border: 1px solid rgba(255,255,255,.20);
+}
+
+h1, h2, h3 { color: var(--erp-navy); letter-spacing: -.02em; }
+h1 {
+    font-weight: 800 !important;
+    padding-bottom: .45rem;
+    border-bottom: 3px solid transparent;
+    border-image: linear-gradient(90deg, var(--erp-blue), var(--erp-cyan), transparent) 1;
+}
+
+[data-testid="stForm"], [data-testid="stVerticalBlockBorderWrapper"] {
+    background: rgba(255,255,255,.96);
+    border: 1px solid #e2e8f0 !important;
+    border-radius: 16px !important;
+    box-shadow: 0 10px 28px rgba(15,23,42,.06);
+}
+
+[data-testid="stMetric"] {
+    background: linear-gradient(145deg, #ffffff 0%, #f8fbff 100%);
+    border: 1px solid #dbeafe;
+    border-radius: 14px;
+    padding: 1rem;
+    box-shadow: 0 8px 22px rgba(37,99,235,.07);
+}
+[data-testid="stMetricValue"] { color: var(--erp-blue); font-weight: 800; }
+
+.stButton > button, .stFormSubmitButton > button {
+    border: 0 !important;
+    border-radius: 10px !important;
+    background: linear-gradient(90deg, var(--erp-blue), #3b82f6) !important;
+    color: white !important;
+    font-weight: 700 !important;
+    box-shadow: 0 7px 16px rgba(37,99,235,.22);
+    transition: transform .15s ease, box-shadow .15s ease;
+}
+.stButton > button:hover, .stFormSubmitButton > button:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 10px 22px rgba(37,99,235,.28);
+}
+
+[data-baseweb="input"] > div, [data-baseweb="select"] > div, textarea {
+    background: #f8fafc !important;
+    border-color: #dbe3ef !important;
+    border-radius: 10px !important;
+}
+[data-baseweb="input"] > div:focus-within, [data-baseweb="select"] > div:focus-within {
+    border-color: var(--erp-blue) !important;
+    box-shadow: 0 0 0 3px rgba(37,99,235,.12) !important;
+}
+
+[data-testid="stDataFrame"] {
+    background: white;
+    border: 1px solid #e2e8f0;
+    border-radius: 14px;
+    overflow: hidden;
+    box-shadow: 0 8px 22px rgba(15,23,42,.05);
+}
+
+.stTabs [data-baseweb="tab-list"] {
+    gap: .35rem;
+    background: #eef4ff;
+    padding: .35rem;
+    border-radius: 12px;
+}
+.stTabs [data-baseweb="tab"] {
+    border-radius: 9px;
+    padding: .45rem .85rem;
+}
+.stTabs [aria-selected="true"] {
+    background: white !important;
+    color: var(--erp-blue) !important;
+    box-shadow: 0 4px 12px rgba(37,99,235,.12);
+}
+
+[data-testid="stAlert"] { border-radius: 12px; }
+hr { border-color: #e2e8f0; }
+
+/* Login screen polish */
+.block-container { padding-top: 2rem; padding-bottom: 3rem; }
+@media (max-width: 900px) {
+    .block-container { padding-left: 1rem; padding-right: 1rem; }
+}
+</style>
+""", unsafe_allow_html=True)
+
 ALL_MODULES = [
     "Dashboard","Reservations","Front Desk","Rooms","Restaurant POS",
     "Kitchen Display","Kitchen Performance","Housekeeping","Inventory",
     "Purchasing","Maintenance","Payments","Expenses","Finance Reports","Reports",
     "User Access"
 ]
+
+MODULE_ICONS = {
+    "Dashboard": "📊", "Reservations": "🗓️", "Front Desk": "🛎️",
+    "Rooms": "🛏️", "Restaurant POS": "🍽️", "Kitchen Display": "👨‍🍳",
+    "Kitchen Performance": "⏱️", "Housekeeping": "🧹", "Inventory": "📦",
+    "Purchasing": "🛒", "Maintenance": "🛠️", "Payments": "💳",
+    "Expenses": "🧾", "Finance Reports": "💹", "Reports": "📑",
+    "User Access": "👥"
+}
 
 # ---------------- Password hashing ----------------
 def hash_password(plain, salt=None):
@@ -672,9 +807,10 @@ if not st.session_state.user:
     st.stop()
 
 user = st.session_state.user
-st.sidebar.title("Hotel ERP")
-st.sidebar.write(f"**{user['full_name']}**")
-st.sidebar.caption(user["role"])
+st.sidebar.markdown("## 🏨 Hotel ERP")
+st.sidebar.markdown(f"**👤 {user['full_name']}**")
+st.sidebar.caption(f"Role: {user['role']}")
+st.sidebar.divider()
 
 visible_pages = [p for p in ALL_MODULES if page_allowed(user["username"], p, user["role"])]
 
@@ -685,7 +821,7 @@ if not visible_pages:
         st.rerun()
     st.stop()
 
-page = st.sidebar.radio("Navigation", visible_pages)
+page = st.sidebar.radio("Navigation", visible_pages, format_func=lambda p: f"{MODULE_ICONS.get(p, '•')}  {p}")
 
 if st.sidebar.button("Logout"):
     st.session_state.user = None
