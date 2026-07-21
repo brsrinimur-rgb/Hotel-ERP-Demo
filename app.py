@@ -1,10 +1,14 @@
-
 import streamlit as st
 import pandas as pd
 import sqlite3
+import hashlib
+import hmac
+import os
 from datetime import datetime, date, timedelta
 from io import BytesIO
 from pathlib import Path
+
+import approvals
 
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "hotel_erp.db"
@@ -14,6 +18,37 @@ st.set_page_config(
     page_icon="🏨",
     layout="wide"
 )
+
+ALL_MODULES = [
+    "Dashboard","Reservations","Front Desk","Rooms","Restaurant POS",
+    "Kitchen Display","Kitchen Performance","Housekeeping","Inventory",
+    "Purchasing","Maintenance","Payments","Expenses","Finance Reports","Reports",
+    "User Access"
+]
+
+# ---------------- Password hashing ----------------
+def hash_password(plain, salt=None):
+    if salt is None:
+        salt_bytes = os.urandom(16)
+    else:
+        salt_bytes = bytes.fromhex(salt) if isinstance(salt, str) else salt
+    dk = hashlib.pbkdf2_hmac('sha256', plain.encode('utf-8'), salt_bytes, 100000)
+    return f"pbkdf2${salt_bytes.hex()}${dk.hex()}"
+
+def verify_password(plain, stored):
+    if not stored:
+        return False
+    stored = str(stored)
+    if stored.startswith("pbkdf2$"):
+        parts = stored.split("$")
+        if len(parts) != 3:
+            return False
+        _, salt_hex, hash_hex = parts
+        salt_bytes = bytes.fromhex(salt_hex)
+        dk = hashlib.pbkdf2_hmac('sha256', plain.encode('utf-8'), salt_bytes, 100000)
+        return hmac.compare_digest(dk.hex(), hash_hex)
+    # legacy plaintext fallback — allows old demo rows to still log in once
+    return hmac.compare_digest(plain, stored)
 
 # ---------------- Database ----------------
 def conn():
@@ -207,7 +242,7 @@ def init_db():
         c.commit()
 
     if scalar("SELECT COUNT(*) FROM users") == 0:
-        users = [
+        seed_users = [
             ("admin", "admin123", "Admin", "System Administrator"),
             ("manager", "manager123", "Manager", "Hotel Manager"),
             ("reception", "front123", "Reception", "Front Desk"),
@@ -216,6 +251,7 @@ def init_db():
             ("housekeeping", "house123", "Housekeeping", "Housekeeping Team"),
             ("accounts", "accounts123", "Accounts", "Accounts Team")
         ]
+        users = [(u, hash_password(p), r, n) for (u, p, r, n) in seed_users]
         with conn() as c:
             c.executemany("INSERT INTO users VALUES(?,?,?,?)", users)
             c.commit()
@@ -269,6 +305,7 @@ def migrate_purchase_orders():
         "payment_method": "TEXT DEFAULT 'Bank Transfer'",
         "payment_terms_days": "INTEGER DEFAULT 30",
         "requested_by": "TEXT DEFAULT ''",
+        "requested_username": "TEXT DEFAULT ''",
         "approval_level": "TEXT DEFAULT 'Manager'",
         "approved_by": "TEXT DEFAULT ''",
         "approved_at": "TEXT DEFAULT ''",
@@ -288,6 +325,131 @@ def migrate_purchase_orders():
             execute(f"ALTER TABLE purchase_orders ADD COLUMN {column} {definition}")
 
 migrate_purchase_orders()
+
+def migrate_supplier_invoices():
+    existing = query("PRAGMA table_info(supplier_invoices)")
+    cols = set(existing["name"].tolist()) if not existing.empty else set()
+    additions = {
+        "paid_amount": "REAL DEFAULT 0",
+        "payment_status": "TEXT DEFAULT 'Unpaid'",
+        "payment_reference": "TEXT DEFAULT ''",
+        "paid_at": "TEXT DEFAULT ''"
+    }
+    for column, definition in additions.items():
+        if column not in cols:
+            execute(f"ALTER TABLE supplier_invoices ADD COLUMN {column} {definition}")
+
+migrate_supplier_invoices()
+
+def migrate_users():
+    existing = query("PRAGMA table_info(users)")
+    cols = set(existing["name"].tolist()) if not existing.empty else set()
+    additions = {
+        "email": "TEXT DEFAULT ''",
+        "mobile": "TEXT DEFAULT ''",
+        "department": "TEXT DEFAULT ''",
+        "is_active": "INTEGER DEFAULT 1",
+        "created_at": "TEXT DEFAULT ''",
+        "last_login": "TEXT DEFAULT ''"
+    }
+    for column, definition in additions.items():
+        if column not in cols:
+            execute(f"ALTER TABLE users ADD COLUMN {column} {definition}")
+
+
+def migrate_inventory_approval():
+    with conn() as c:
+        c.executescript("""
+        CREATE TABLE IF NOT EXISTS stock_adjustment_batches(
+            batch_no TEXT PRIMARY KEY,
+            batch_date TEXT,
+            adjustment_source TEXT,
+            file_name TEXT,
+            location TEXT,
+            total_lines INTEGER,
+            total_increase_qty REAL,
+            total_decrease_qty REAL,
+            total_variance_value REAL,
+            submitted_by TEXT,
+            submitted_username TEXT,
+            submitted_at TEXT,
+            status TEXT,
+            reviewed_by TEXT,
+            reviewed_username TEXT,
+            reviewed_at TEXT,
+            review_comments TEXT,
+            posted_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS stock_adjustment_lines(
+            line_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_no TEXT,
+            item_code TEXT,
+            item_name TEXT,
+            adjustment_type TEXT,
+            quantity REAL,
+            reason TEXT,
+            system_qty REAL,
+            projected_qty REAL,
+            difference_qty REAL,
+            unit_cost REAL,
+            variance_value REAL,
+            validation_status TEXT,
+            validation_message TEXT,
+            FOREIGN KEY(batch_no) REFERENCES stock_adjustment_batches(batch_no)
+        );
+
+        CREATE TABLE IF NOT EXISTS inventory_audit_log(
+            audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_no TEXT,
+            item_code TEXT,
+            item_name TEXT,
+            transaction_type TEXT,
+            before_qty REAL,
+            change_qty REAL,
+            after_qty REAL,
+            unit_cost REAL,
+            value_impact REAL,
+            reason TEXT,
+            action_by TEXT,
+            action_username TEXT,
+            action_at TEXT,
+            approval_by TEXT,
+            approval_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS opening_stock_requests(
+            item_code TEXT PRIMARY KEY,
+            item_name TEXT,
+            requested_qty REAL,
+            requested_by TEXT,
+            requested_username TEXT,
+            requested_at TEXT,
+            status TEXT
+        );
+        """)
+        c.commit()
+
+def migrate_user_access():
+    with conn() as c:
+        c.executescript("""
+        CREATE TABLE IF NOT EXISTS user_module_access(
+            username TEXT,
+            module TEXT,
+            PRIMARY KEY(username, module)
+        );
+
+        CREATE TABLE IF NOT EXISTS user_access_mode(
+            username TEXT PRIMARY KEY,
+            use_custom INTEGER DEFAULT 0
+        );
+        """)
+        c.commit()
+
+migrate_users()
+migrate_inventory_approval()
+migrate_user_access()
+approvals.init_approval_schema(conn)
 
 # ---------------- Helpers ----------------
 def money(v):
@@ -313,7 +475,110 @@ def stock_df():
     )
     return df
 
-def page_allowed(page, role):
+def next_adjustment_batch():
+    today = date.today().strftime("%Y%m%d")
+    prefix = f"ADJ-{today}-"
+    n = int(scalar(
+        "SELECT COUNT(*) FROM stock_adjustment_batches WHERE batch_no LIKE ?",
+        (prefix + "%",),
+        default=0
+    )) + 1
+    return f"{prefix}{n:04d}"
+
+
+def normalize_adjustment_type(value):
+    text = str(value or "").strip().lower()
+    received = {"stock received", "received", "receipt", "increase", "add", "stock in"}
+    issued = {"stock issued", "stock issued / used", "issued", "used", "decrease", "deduct", "stock out"}
+    if text in received:
+        return "Stock Received"
+    if text in issued:
+        return "Stock Issued / Used"
+    return ""
+
+
+def adjustment_preview(upload_df):
+    required = ["Item", "Adjustment Type", "Quantity", "Remarks"]
+    result = upload_df.copy()
+    result.columns = [str(c).strip() for c in result.columns]
+    for col in required:
+        if col not in result.columns:
+            result[col] = ""
+    result = result[required].copy()
+    result = result.dropna(how="all").reset_index(drop=True)
+
+    inventory = query("""
+        SELECT item_code,item_name,unit,unit_cost,
+               opening_qty+received_qty-issued_qty AS system_qty
+        FROM inventory
+    """)
+    by_name = {str(r.item_name).strip().lower(): r for r in inventory.itertuples()}
+    by_code = {str(r.item_code).strip().lower(): r for r in inventory.itertuples()}
+
+    rows = []
+    seen = set()
+    for idx, row in result.iterrows():
+        item = str(row["Item"] or "").strip()
+        adj_type = normalize_adjustment_type(row["Adjustment Type"])
+        try:
+            qty = float(row["Quantity"])
+        except Exception:
+            qty = 0.0
+        reason = str(row["Remarks"] or "").strip()
+        inv = by_code.get(item.lower()) or by_name.get(item.lower())
+        status = "Valid"
+        message = "Ready for submission"
+        item_code = ""
+        item_name = item
+        system_qty = 0.0
+        projected_qty = 0.0
+        unit_cost = 0.0
+
+        if not item:
+            status, message = "Error", "Item is required"
+        elif inv is None:
+            status, message = "Error", "Item not found in inventory"
+        else:
+            item_code = str(inv.item_code)
+            item_name = str(inv.item_name)
+            system_qty = float(inv.system_qty or 0)
+            unit_cost = float(inv.unit_cost or 0)
+            key = item_code.lower()
+            if key in seen:
+                status, message = "Error", "Duplicate item in upload"
+            seen.add(key)
+
+        if not adj_type:
+            status, message = "Error", "Adjustment Type must be Stock Received or Stock Issued / Used"
+        if qty <= 0:
+            status, message = "Error", "Quantity must be greater than zero"
+        if not reason:
+            status, message = "Error", "Remarks / reason is required"
+
+        signed_qty = qty if adj_type == "Stock Received" else -qty
+        projected_qty = system_qty + signed_qty
+        if inv is not None and projected_qty < -0.000001:
+            status, message = "Error", f"Insufficient stock; available {system_qty:.2f}"
+
+        rows.append({
+            "Row": idx + 2,
+            "Item Code": item_code,
+            "Item": item_name,
+            "Adjustment Type": adj_type or str(row["Adjustment Type"]),
+            "Quantity": qty,
+            "System Quantity": system_qty,
+            "Projected Quantity": projected_qty,
+            "Difference": signed_qty,
+            "Unit Cost": unit_cost,
+            "Variance Value": signed_qty * unit_cost,
+            "Remarks": reason,
+            "Validation": status,
+            "Message": message
+        })
+    return pd.DataFrame(rows)
+
+
+def role_default_modules(role):
     access = {
         "Admin": None,
         "Manager": None,
@@ -324,7 +589,51 @@ def page_allowed(page, role):
         "Accounts": {"Dashboard","Payments","Expenses","Purchasing","Inventory","Finance Reports","Reports"}
     }
     allowed = access.get(role)
-    return allowed is None or page in allowed
+    return set(ALL_MODULES) if allowed is None else allowed
+
+
+def get_access_mode(username):
+    return int(scalar("SELECT use_custom FROM user_access_mode WHERE username=?", (username,), default=0))
+
+
+def get_user_custom_modules(username):
+    """Returns a set of allowed modules (possibly EMPTY on purpose) if this
+    user has custom access turned on, or None if they're on role defaults."""
+    if not get_access_mode(username):
+        return None
+    df = query("SELECT module FROM user_module_access WHERE username=?", (username,))
+    return set(df["module"].tolist())
+
+
+def page_allowed(username, page, role):
+    custom = get_user_custom_modules(username)
+    allowed = custom if custom is not None else role_default_modules(role)
+    if role == "Admin":
+        # Admins can never be locked out of the modules needed to fix access.
+        allowed = set(allowed) | {"Dashboard", "User Access"}
+    return page in allowed
+
+
+def sync_po_payment_rollup(po_no):
+    """Recomputes purchase_orders.paid_amount / payment_status as an aggregate
+    of that PO's supplier_invoices rows. Invoice-level rows are the source of
+    truth for payment tracking; this rollup exists only so older parts of the
+    UI (Cancel PO, Approval Queue table) that display a single PO-level status
+    keep working sensibly when a PO has multiple invoices."""
+    invoices = query(
+        "SELECT total_amount, paid_amount, payment_status FROM supplier_invoices WHERE po_no=?",
+        (po_no,)
+    )
+    if invoices.empty:
+        return
+    total_paid = float(invoices["paid_amount"].fillna(0).astype(float).sum())
+    all_paid = bool((invoices["payment_status"] == "Paid").all())
+    any_paid = total_paid > 0
+    status = "Paid" if all_paid else ("Partially Paid" if any_paid else "Unpaid")
+    execute(
+        "UPDATE purchase_orders SET paid_amount=?, payment_status=? WHERE po_no=?",
+        (total_paid, status, po_no)
+    )
 
 # ---------------- Login ----------------
 if "user" not in st.session_state:
@@ -338,14 +647,25 @@ if not st.session_state.user:
         password = st.text_input("Password", type="password")
         login = st.form_submit_button("Login", type="primary")
     if login:
-        user = query(
-            "SELECT username, role, full_name FROM users WHERE username=? AND password=?",
-            (username, password)
+        user_row = query(
+            """SELECT username, role, full_name, password
+               FROM users
+               WHERE username=? AND COALESCE(is_active,1)=1""",
+            (username,)
         )
-        if user.empty:
+        if user_row.empty or not verify_password(password, user_row.iloc[0]["password"]):
             st.error("Invalid username or password.")
         else:
-            st.session_state.user = user.iloc[0].to_dict()
+            stored_password = str(user_row.iloc[0]["password"])
+            if not stored_password.startswith("pbkdf2$"):
+                # Transparent upgrade: first successful login on a legacy
+                # plaintext row re-saves it hashed.
+                execute("UPDATE users SET password=? WHERE username=?", (hash_password(password), username))
+            st.session_state.user = user_row.iloc[0][["username", "role", "full_name"]].to_dict()
+            execute(
+                "UPDATE users SET last_login=? WHERE username=?",
+                (datetime.now().isoformat(timespec="seconds"), username)
+            )
             st.rerun()
 
     st.info("Demo admin login: admin / admin123")
@@ -356,20 +676,236 @@ st.sidebar.title("Hotel ERP")
 st.sidebar.write(f"**{user['full_name']}**")
 st.sidebar.caption(user["role"])
 
-pages = [
-    "Dashboard","Reservations","Front Desk","Rooms","Restaurant POS",
-    "Kitchen Display","Kitchen Performance","Housekeeping","Inventory",
-    "Purchasing","Maintenance","Payments","Expenses","Finance Reports","Reports"
-]
-visible_pages = [p for p in pages if page_allowed(p, user["role"])]
+visible_pages = [p for p in ALL_MODULES if page_allowed(user["username"], p, user["role"])]
+
+if not visible_pages:
+    st.warning("You currently have no module access. Contact the system administrator.")
+    if st.sidebar.button("Logout"):
+        st.session_state.user = None
+        st.rerun()
+    st.stop()
+
 page = st.sidebar.radio("Navigation", visible_pages)
 
 if st.sidebar.button("Logout"):
     st.session_state.user = None
     st.rerun()
 
+
+# ---------------- User Access ----------------
+if page == "User Access":
+    st.title("User Access Management")
+
+    if user["role"] != "Admin":
+        st.error("Only the System Administrator can manage users.")
+        st.stop()
+
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "User Register",
+        "Create User",
+        "Reset Password",
+        "Activate / Deactivate",
+        "Manage Access"
+    ])
+
+    with tab1:
+        users_df = query("""
+            SELECT username, full_name, role, department, email, mobile,
+                   CASE WHEN COALESCE(is_active,1)=1 THEN 'Active' ELSE 'Inactive' END AS status,
+                   created_at, last_login
+            FROM users
+            ORDER BY username
+        """)
+        st.dataframe(users_df, use_container_width=True, hide_index=True)
+
+        role_access = pd.DataFrame([
+            ["Admin", "All modules and user management"],
+            ["Manager", "All operational and management modules"],
+            ["Reception", "Dashboard, Reservations, Front Desk, Rooms, Maintenance"],
+            ["Restaurant", "Dashboard, Restaurant POS, Payments"],
+            ["Kitchen", "Dashboard, Kitchen Display, Kitchen Performance, Inventory"],
+            ["Housekeeping", "Dashboard, Housekeeping, Maintenance"],
+            ["Accounts", "Dashboard, Payments, Expenses, Purchasing, Inventory, Finance Reports, Reports"]
+        ], columns=["Role", "Access"])
+        st.caption("Default access by role. Individual users can be given custom access under Manage Access.")
+        st.dataframe(role_access, use_container_width=True, hide_index=True)
+
+    with tab2:
+        with st.form("create_user", clear_on_submit=True):
+            c1, c2, c3 = st.columns(3)
+            new_username = c1.text_input("Username")
+            full_name = c2.text_input("Full Name")
+            role = c3.selectbox(
+                "Role",
+                ["Admin","Manager","Reception","Restaurant","Kitchen","Housekeeping","Accounts"]
+            )
+
+            c1, c2, c3 = st.columns(3)
+            department = c1.text_input("Department")
+            email = c2.text_input("Email")
+            mobile = c3.text_input("Mobile")
+
+            c1, c2 = st.columns(2)
+            password = c1.text_input("Temporary Password", type="password")
+            confirm_password = c2.text_input("Confirm Password", type="password")
+            create_user = st.form_submit_button("Create User", type="primary")
+
+        if create_user:
+            if not new_username.strip() or not full_name.strip():
+                st.error("Username and full name are required.")
+            elif len(password) < 6:
+                st.error("Password must contain at least 6 characters.")
+            elif password != confirm_password:
+                st.error("Passwords do not match.")
+            elif scalar("SELECT COUNT(*) FROM users WHERE LOWER(username)=LOWER(?)",(new_username.strip(),)) > 0:
+                st.error("Username already exists.")
+            else:
+                execute(
+                    """INSERT INTO users(
+                        username,password,role,full_name,email,mobile,department,
+                        is_active,created_at,last_login
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        new_username.strip(), hash_password(password), role, full_name.strip(),
+                        email.strip(), mobile.strip(), department.strip(), 1,
+                        datetime.now().isoformat(timespec="seconds"), ""
+                    )
+                )
+                st.success(f"User {new_username.strip()} created successfully.")
+                st.rerun()
+
+    with tab3:
+        users_df = query("SELECT username, full_name FROM users ORDER BY username")
+        username_to_reset = st.selectbox("Select User", users_df["username"].tolist(), key="reset_user")
+        c1, c2 = st.columns(2)
+        new_password = c1.text_input("New Password", type="password", key="new_password")
+        confirm_new_password = c2.text_input("Confirm New Password", type="password", key="confirm_new_password")
+
+        if st.button("Reset Password", type="primary"):
+            if len(new_password) < 6:
+                st.error("Password must contain at least 6 characters.")
+            elif new_password != confirm_new_password:
+                st.error("Passwords do not match.")
+            else:
+                execute("UPDATE users SET password=? WHERE username=?", (hash_password(new_password), username_to_reset))
+                st.success(f"Password reset for {username_to_reset}.")
+
+    with tab4:
+        users_df = query("""
+            SELECT username, full_name, role, COALESCE(is_active,1) AS is_active
+            FROM users ORDER BY username
+        """)
+        selected_user = st.selectbox("Select User", users_df["username"].tolist(), key="activate_user")
+        selected_row = users_df[users_df["username"] == selected_user].iloc[0]
+        current_status = "Active" if int(selected_row["is_active"]) == 1 else "Inactive"
+
+        st.info(
+            f"User: {selected_row['full_name']} | Role: {selected_row['role']} | "
+            f"Current Status: {current_status}"
+        )
+
+        action = st.radio("Action", ["Activate", "Deactivate"], horizontal=True)
+
+        if selected_user == user["username"] and action == "Deactivate":
+            st.warning("You cannot deactivate your own logged-in administrator account.")
+        elif st.button("Update User Status", type="primary"):
+            execute(
+                "UPDATE users SET is_active=? WHERE username=?",
+                (1 if action == "Activate" else 0, selected_user)
+            )
+            st.success(f"{selected_user} updated successfully.")
+            st.rerun()
+
+    with tab5:
+        st.subheader("Manage Module Access")
+        st.caption(
+            "By default every user gets the modules their role allows. Turn on custom access "
+            "to grant or restrict specific modules for one user — including setting zero modules "
+            "if that's intended. Admin-role users always keep Dashboard and User Access, even "
+            "with custom access enabled, so an admin can never be locked out of fixing access."
+        )
+        access_users_df = query("SELECT username, full_name, role FROM users ORDER BY username")
+        selected_username = st.selectbox("Select User", access_users_df["username"].tolist(), key="access_user")
+        selected_role = access_users_df.loc[access_users_df["username"] == selected_username, "role"].iloc[0]
+
+        current_mode = get_access_mode(selected_username)
+        use_custom = st.checkbox(
+            "Use custom module access for this user (overrides role default)",
+            value=bool(current_mode),
+            key="use_custom_access"
+        )
+
+        if use_custom:
+            if current_mode:
+                existing = query("SELECT module FROM user_module_access WHERE username=?", (selected_username,))
+                default_selection = sorted(existing["module"].tolist())
+            else:
+                default_selection = sorted(role_default_modules(selected_role))
+
+            selected_modules = st.multiselect(
+                "Modules this user can access (leave empty to block all modules)",
+                ALL_MODULES,
+                default=default_selection,
+                key="access_modules"
+            )
+
+            if st.button("Save Module Access", type="primary"):
+                with conn() as c:
+                    c.execute("DELETE FROM user_module_access WHERE username=?", (selected_username,))
+                    c.executemany(
+                        "INSERT INTO user_module_access(username,module) VALUES(?,?)",
+                        [(selected_username, m) for m in selected_modules]
+                    )
+                    c.execute(
+                        """INSERT INTO user_access_mode(username,use_custom) VALUES(?,1)
+                           ON CONFLICT(username) DO UPDATE SET use_custom=1""",
+                        (selected_username,)
+                    )
+                    c.commit()
+                if selected_role == "Admin":
+                    st.info("Note: Admin role retains Dashboard and User Access regardless of this selection.")
+                st.success(f"Custom module access saved for {selected_username}.")
+                st.rerun()
+        else:
+            if current_mode:
+                st.warning(f"{selected_username} currently has custom access overrides.")
+                if st.button("Revert to Role-Based Access", type="primary"):
+                    with conn() as c:
+                        c.execute("DELETE FROM user_module_access WHERE username=?", (selected_username,))
+                        c.execute("DELETE FROM user_access_mode WHERE username=?", (selected_username,))
+                        c.commit()
+                    st.success(f"{selected_username} reverted to role-based default access.")
+                    st.rerun()
+            else:
+                st.info(f"{selected_username} is currently using role-based default access ({selected_role}).")
+
+        st.markdown("### Current Access Overrides")
+        overrides = query("""
+            SELECT uma.username, u.full_name, u.role, uma.module
+            FROM user_module_access uma
+            JOIN users u ON u.username = uma.username
+            JOIN user_access_mode m ON m.username = uma.username AND m.use_custom = 1
+            ORDER BY uma.username, uma.module
+        """)
+        zero_access = query("""
+            SELECT m.username, u.full_name, u.role
+            FROM user_access_mode m
+            JOIN users u ON u.username = m.username
+            WHERE m.use_custom = 1
+              AND NOT EXISTS (SELECT 1 FROM user_module_access uma WHERE uma.username = m.username)
+        """)
+        if overrides.empty and zero_access.empty:
+            st.info("No users currently have custom module access overrides.")
+        else:
+            if not overrides.empty:
+                st.dataframe(overrides, use_container_width=True, hide_index=True)
+            if not zero_access.empty:
+                st.warning("These users have custom access enabled with zero modules selected (no access, except forced Admin defaults):")
+                st.dataframe(zero_access, use_container_width=True, hide_index=True)
+
 # ---------------- Dashboard ----------------
-if page == "Dashboard":
+elif page == "Dashboard":
+
     st.title("Executive Dashboard")
     total_rooms = scalar("SELECT COUNT(*) FROM rooms")
     occupied = scalar("SELECT COUNT(*) FROM rooms WHERE status='Occupied'")
@@ -690,124 +1226,489 @@ elif page == "Housekeeping":
 
 # ---------------- Inventory ----------------
 elif page == "Inventory":
-    st.title("Inventory & Food Cost")
+    st.title("Inventory Control Center")
+    st.caption("All manual and Excel stock adjustments require independent approval before inventory is updated.")
 
-    tab1, tab2, tab3 = st.tabs(["Inventory List", "Add New Item", "Stock Adjustment"])
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+        "Inventory List", "Add New Item", "Submit Adjustment",
+        "Approval Inbox", "Pending Approval", "My Submitted Requests",
+        "Approval History", "LP Audit Dashboard"
+    ])
 
     with tab1:
-        stocks=stock_df()
-        c1,c2,c3=st.columns(3)
-        c1.metric("Stock Value",money(stocks["stock_value"].sum()))
-        c2.metric("Items to Reorder",int((stocks["stock_status"]=="REORDER").sum()))
-        c3.metric("Inventory Items",len(stocks))
-
-        category_filter=st.multiselect(
+        stocks = stock_df()
+        c1,c2,c3,c4 = st.columns(4)
+        c1.metric("Stock Value", money(stocks["stock_value"].sum()))
+        c2.metric("Items to Reorder", int((stocks["stock_status"]=="REORDER").sum()))
+        c3.metric("Inventory Items", len(stocks))
+        c4.metric("Pending Batches", int(scalar(
+            "SELECT COUNT(*) FROM stock_adjustment_batches WHERE status='Pending Approval'"
+        )))
+        category_filter = st.multiselect(
             "Filter Category",
             sorted(stocks["category"].dropna().unique().tolist()),
             default=sorted(stocks["category"].dropna().unique().tolist())
         )
-        filtered_stocks=stocks[stocks["category"].isin(category_filter)] if category_filter else stocks
-        st.dataframe(filtered_stocks,use_container_width=True,hide_index=True)
+        filtered_stocks = stocks[stocks["category"].isin(category_filter)] if category_filter else stocks
+        st.dataframe(filtered_stocks, use_container_width=True, hide_index=True)
 
     with tab2:
         st.subheader("Add Inventory Item")
         with st.form("add_inventory_item", clear_on_submit=True):
-            c1,c2,c3=st.columns(3)
-            item_name=c1.text_input("Item Name")
-            category=c2.selectbox(
-                "Category",
-                ["Food","Beverage","Housekeeping","Maintenance","Linen","Cleaning","Other"]
-            )
-            unit=c3.selectbox(
-                "Unit",
-                ["kg","gram","litre","ml","bottle","piece","box","carton","pack","set","roll","dozen"]
-            )
-
-            c1,c2,c3=st.columns(3)
-            opening_qty=c1.number_input("Opening Quantity",min_value=0.0,value=0.0,step=1.0)
-            reorder_level=c2.number_input("Reorder Level",min_value=0.0,value=0.0,step=1.0)
-            unit_cost=c3.number_input("Unit Cost (SAR)",min_value=0.0,value=0.0,step=0.50)
-
-            add_item=st.form_submit_button("Add Inventory Item",type="primary")
-
+            c1,c2,c3 = st.columns(3)
+            item_name = c1.text_input("Item Name")
+            category = c2.selectbox("Category", [
+                "Food","Beverage","Housekeeping","Maintenance","Linen","Cleaning","Other"
+            ])
+            unit = c3.selectbox("Unit", [
+                "kg","gram","litre","ml","bottle","piece","box","carton","pack","set","roll","dozen"
+            ])
+            c1,c2,c3 = st.columns(3)
+            opening_qty = c1.number_input("Opening Quantity", min_value=0.0, value=0.0, step=1.0)
+            reorder_level = c2.number_input("Reorder Level", min_value=0.0, value=0.0, step=1.0)
+            unit_cost = c3.number_input("Unit Cost (SAR)", min_value=0.0, value=0.0, step=0.50)
+            add_item = st.form_submit_button("Add Inventory Item", type="primary")
         if add_item:
-            clean_name=item_name.strip()
+            clean_name = item_name.strip()
             if not clean_name:
                 st.error("Item name is required.")
-            elif scalar("SELECT COUNT(*) FROM inventory WHERE LOWER(item_name)=LOWER(?)",(clean_name,)) > 0:
+            elif scalar("SELECT COUNT(*) FROM inventory WHERE LOWER(item_name)=LOWER(?)", (clean_name,)) > 0:
                 st.error("This inventory item already exists.")
             else:
-                item_code=next_code("INV","inventory")
-                execute(
-                    "INSERT INTO inventory VALUES(?,?,?,?,?,?,?,?,?)",
-                    (
-                        item_code,
-                        clean_name,
-                        category,
-                        unit,
-                        opening_qty,
-                        0.0,
-                        0.0,
-                        reorder_level,
-                        unit_cost
-                    )
+                item_code = next_code("INV", "inventory")
+                now = datetime.now().isoformat(timespec="seconds")
+                execute("INSERT INTO inventory VALUES(?,?,?,?,?,?,?,?,?)", (
+                    item_code, clean_name, category, unit, 0.0, 0.0, 0.0,
+                    reorder_level, unit_cost
+                ))
+                execute("""INSERT INTO opening_stock_requests(
+                    item_code,item_name,requested_qty,requested_by,requested_username,requested_at,status
+                ) VALUES(?,?,?,?,?,?,?)""", (
+                    item_code, clean_name, float(opening_qty), user["full_name"],
+                    user["username"], now, "Pending Approval"
+                ))
+                approvals.submit_request(
+                    execute, scalar,
+                    module="Opening Stock",
+                    record_id=item_code,
+                    title=f"Opening stock — {clean_name} ({opening_qty:g} {unit})",
+                    submitted_by=user["full_name"],
+                    submitted_username=user["username"],
+                    approver_chain=["Manager"],
+                    sla_hours=24
                 )
-                st.success(f"{clean_name} added successfully with code {item_code}.")
+                st.success(f"{clean_name} added with code {item_code}. Opening stock is pending approval.")
                 st.rerun()
-
-        st.caption("New items will also become available in Purchasing for purchase orders.")
 
     with tab3:
-        st.subheader("Manual Stock Adjustment")
-        inventory_items=query("SELECT item_code,item_name,unit FROM inventory ORDER BY item_name")
-        if inventory_items.empty:
-            st.info("No inventory items available.")
+        st.subheader("Submit Stock Adjustment for Approval")
+        mode = st.radio("Entry Method", ["Excel Upload", "Manual Entry"], horizontal=True)
+        location = st.selectbox("Store / Location", [
+            "Main Store", "Kitchen Store", "Housekeeping Store", "Maintenance Store", "Other"
+        ])
+        preview = pd.DataFrame()
+        source_name = "Manual Entry"
+
+        if mode == "Excel Upload":
+            template = pd.DataFrame([
+                ["Chicken", "Stock Received", 25, "Supplier delivery correction"],
+                ["Rice", "Stock Issued / Used", 10, "Physical count shortage"]
+            ], columns=["Item", "Adjustment Type", "Quantity", "Remarks"])
+            st.download_button(
+                "Download Upload Template",
+                data=excel_file({"Stock Adjustment": template}),
+                file_name="Hotel_ERP_Stock_Adjustment_Template.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+            uploaded = st.file_uploader("Upload completed Excel file", type=["xlsx", "xls"])
+            if uploaded is not None:
+                source_name = uploaded.name
+                try:
+                    upload_df = pd.read_excel(uploaded)
+                    preview = adjustment_preview(upload_df)
+                except Exception as exc:
+                    st.error(f"Unable to read the Excel file: {exc}")
         else:
-            with st.form("stock_adjustment"):
-                selected_item=st.selectbox(
-                    "Inventory Item",
-                    inventory_items["item_name"].tolist()
-                )
-                adjustment_type=st.selectbox(
-                    "Adjustment Type",
-                    ["Stock Received","Stock Issued / Used"]
-                )
-                adjustment_qty=st.number_input(
-                    "Quantity",
-                    min_value=0.01,
-                    value=1.0,
-                    step=1.0
-                )
-                update_stock=st.form_submit_button("Update Stock",type="primary")
+            inventory_items = query("SELECT item_code,item_name,unit FROM inventory ORDER BY item_name")
+            with st.form("manual_adjustment_approval", clear_on_submit=False):
+                item = st.selectbox("Inventory Item", inventory_items["item_name"].tolist())
+                adjustment_type = st.selectbox("Adjustment Type", ["Stock Received", "Stock Issued / Used"])
+                quantity = st.number_input("Quantity", min_value=0.01, value=1.0, step=1.0)
+                reason = st.text_area("Reason / Remarks")
+                build_preview = st.form_submit_button("Validate Entry")
+            if build_preview:
+                preview = adjustment_preview(pd.DataFrame([{
+                    "Item": item, "Adjustment Type": adjustment_type,
+                    "Quantity": quantity, "Remarks": reason
+                }]))
+                st.session_state["manual_adjustment_preview"] = preview
+            elif "manual_adjustment_preview" in st.session_state:
+                preview = st.session_state["manual_adjustment_preview"]
 
-            if update_stock:
-                selected_row=inventory_items[
-                    inventory_items["item_name"]==selected_item
-                ].iloc[0]
-
-                if adjustment_type=="Stock Received":
-                    execute(
-                        "UPDATE inventory SET received_qty=received_qty+? WHERE item_code=?",
-                        (adjustment_qty,selected_row["item_code"])
-                    )
-                else:
-                    available=scalar(
-                        "SELECT opening_qty+received_qty-issued_qty FROM inventory WHERE item_code=?",
-                        (selected_row["item_code"],)
-                    )
-                    if adjustment_qty > float(available):
-                        st.error(f"Insufficient stock. Available quantity: {available:.2f}")
-                        st.stop()
-                    execute(
-                        "UPDATE inventory SET issued_qty=issued_qty+? WHERE item_code=?",
-                        (adjustment_qty,selected_row["item_code"])
-                    )
-
-                st.success(
-                    f"{adjustment_type} updated for {selected_item}: "
-                    f"{adjustment_qty} {selected_row['unit']}."
+        if not preview.empty:
+            st.markdown("### Validation & Variance Preview")
+            def highlight_validation(row):
+                if row["Validation"] == "Error":
+                    return ["background-color: #ffd6d6"] * len(row)
+                if abs(float(row["Difference"])) > 0:
+                    return ["background-color: #fff2cc"] * len(row)
+                return [""] * len(row)
+            st.dataframe(preview.style.apply(highlight_validation, axis=1), use_container_width=True, hide_index=True)
+            errors = int((preview["Validation"] == "Error").sum())
+            c1,c2,c3,c4 = st.columns(4)
+            c1.metric("Uploaded Lines", len(preview))
+            c2.metric("Validation Errors", errors)
+            c3.metric("Net Quantity Difference", f"{preview['Difference'].sum():,.2f}")
+            c4.metric("Net Value Impact", money(preview["Variance Value"].sum()))
+            approval_note = st.text_area("Submission Note", key="adjustment_submission_note")
+            confirm = st.checkbox("I confirm the quantities and reasons are correct and submit them for approval.")
+            if st.button("Submit Batch for Approval", type="primary", disabled=(errors > 0 or not confirm)):
+                batch_no = next_adjustment_batch()
+                now = datetime.now().isoformat(timespec="seconds")
+                increase_qty = float(preview.loc[preview["Difference"] > 0, "Difference"].sum())
+                decrease_qty = abs(float(preview.loc[preview["Difference"] < 0, "Difference"].sum()))
+                execute("""INSERT INTO stock_adjustment_batches(
+                    batch_no,batch_date,adjustment_source,file_name,location,total_lines,
+                    total_increase_qty,total_decrease_qty,total_variance_value,
+                    submitted_by,submitted_username,submitted_at,status,review_comments
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                    batch_no, str(date.today()), mode, source_name, location, len(preview),
+                    increase_qty, decrease_qty, float(preview["Variance Value"].sum()),
+                    user["full_name"], user["username"], now, "Pending Approval", approval_note.strip()
+                ))
+                with conn() as c:
+                    c.executemany("""INSERT INTO stock_adjustment_lines(
+                        batch_no,item_code,item_name,adjustment_type,quantity,reason,
+                        system_qty,projected_qty,difference_qty,unit_cost,variance_value,
+                        validation_status,validation_message
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""", [(
+                        batch_no, r["Item Code"], r["Item"], r["Adjustment Type"], float(r["Quantity"]),
+                        r["Remarks"], float(r["System Quantity"]), float(r["Projected Quantity"]),
+                        float(r["Difference"]), float(r["Unit Cost"]), float(r["Variance Value"]),
+                        r["Validation"], r["Message"]
+                    ) for _, r in preview.iterrows()])
+                    c.commit()
+                variance_value = float(preview["Variance Value"].abs().sum())
+                chain = approvals.approval_chain_for_value(variance_value)
+                approvals.submit_request(
+                    execute, scalar,
+                    module="Stock Adjustment",
+                    record_id=batch_no,
+                    title=f"Stock adjustment — {location} ({len(preview)} line(s), {money(variance_value)})",
+                    submitted_by=user["full_name"],
+                    submitted_username=user["username"],
+                    approver_chain=chain,
+                    sla_hours=24
                 )
+                st.session_state.pop("manual_adjustment_preview", None)
+                st.success(f"Batch {batch_no} submitted. Inventory has not been updated.")
                 st.rerun()
+
+    with tab4:
+        st.subheader("Approval Inbox")
+        st.caption("Requests waiting on your role. You cannot approve your own submissions. Higher-value requests may require multiple sequential sign-offs.")
+        inbox_raw = approvals.get_inbox(query, user["username"], user["role"])
+        inbox = inbox_raw[inbox_raw["module"]!="Purchase Order"] if not inbox_raw.empty else inbox_raw
+        if inbox.empty:
+            st.info("Your approval inbox is empty.")
+        else:
+            st.dataframe(inbox, use_container_width=True, hide_index=True)
+            request_id = st.selectbox("Select Request", inbox["request_id"].tolist(), key="inbox_request")
+            req_row = inbox[inbox["request_id"] == request_id].iloc[0]
+            module = req_row["module"]
+
+            if module == "Stock Adjustment":
+                batch_no = req_row["record_id"]
+                lines = query("SELECT * FROM stock_adjustment_lines WHERE batch_no=? ORDER BY line_id", (batch_no,))
+                st.dataframe(lines[[
+                    "item_code","item_name","adjustment_type","quantity","system_qty",
+                    "projected_qty","difference_qty","unit_cost","variance_value","reason"
+                ]], use_container_width=True, hide_index=True)
+
+                decision = st.radio("Decision", ["Approve", "Reject", "Return"], horizontal=True, key="inbox_decision")
+                comments = st.text_area("Comments", key="inbox_comments")
+
+                if st.button("Submit Decision", type="primary", key="inbox_submit"):
+                    if not approvals.is_step_pending(query, int(req_row["step_id"])):
+                        st.error("This request was already processed by another approver. Refresh the inbox.")
+                        st.rerun()
+                    elif decision != "Approve" and not comments.strip():
+                        st.error("Comments are required for rejection or return.")
+                    else:
+                        posting_error = None
+                        result = None
+                        try:
+                            with conn() as c:
+                                if decision == "Approve":
+                                    for _, line in lines.iterrows():
+                                        inv = c.execute("""SELECT opening_qty+received_qty-issued_qty
+                                                           FROM inventory WHERE item_code=?""", (line["item_code"],)).fetchone()
+                                        if not inv:
+                                            raise RuntimeError(f"Item {line['item_code']} no longer exists.")
+                                        current_qty = float(inv[0] or 0)
+                                        qty = float(line["quantity"] or 0)
+                                        if line["adjustment_type"] == "Stock Issued / Used" and qty > current_qty + 0.000001:
+                                            raise RuntimeError(f"Insufficient current stock for {line['item_name']}. Available {current_qty:.2f}.")
+
+                                result = approvals.act_on_step_conn(c, request_id, int(req_row["step_id"]), decision,
+                                                                     comments, user["full_name"], user["username"])
+
+                                if result == "final_approved":
+                                    for _, line in lines.iterrows():
+                                        before = float(c.execute("""SELECT opening_qty+received_qty-issued_qty
+                                                                   FROM inventory WHERE item_code=?""", (line["item_code"],)).fetchone()[0] or 0)
+                                        qty = float(line["quantity"] or 0)
+                                        if line["adjustment_type"] == "Stock Received":
+                                            c.execute("UPDATE inventory SET received_qty=received_qty+? WHERE item_code=?", (qty, line["item_code"]))
+                                            change = qty
+                                        else:
+                                            c.execute("UPDATE inventory SET issued_qty=issued_qty+? WHERE item_code=?", (qty, line["item_code"]))
+                                            change = -qty
+                                        after = before + change
+                                        c.execute("""INSERT INTO inventory_audit_log(
+                                            batch_no,item_code,item_name,transaction_type,before_qty,change_qty,
+                                            after_qty,unit_cost,value_impact,reason,action_by,action_username,
+                                            action_at,approval_by,approval_at
+                                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                                            batch_no, line["item_code"], line["item_name"], line["adjustment_type"],
+                                            before, change, after, float(line["unit_cost"] or 0),
+                                            change * float(line["unit_cost"] or 0), line["reason"],
+                                            req_row["submitted_by"], "", req_row["submitted_at"],
+                                            user["full_name"], datetime.now().isoformat(timespec="seconds")
+                                        ))
+                                    c.execute("UPDATE stock_adjustment_batches SET status='Posted' WHERE batch_no=?", (batch_no,))
+                                elif result in ("rejected", "returned"):
+                                    new_status = "Rejected" if result == "rejected" else "Returned for Correction"
+                                    c.execute("UPDATE stock_adjustment_batches SET status=? WHERE batch_no=?", (new_status, batch_no))
+                                c.commit()
+                        except Exception as e:
+                            posting_error = str(e)
+
+                        if posting_error:
+                            st.error(posting_error)
+                        elif result == "final_approved":
+                            st.success(f"{batch_no} approved and posted to inventory.")
+                            st.rerun()
+                        elif result == "next_level":
+                            st.success(f"{batch_no} approved at this level — advanced to the next approver.")
+                            st.rerun()
+                        elif result == "rejected":
+                            st.success(f"{batch_no} marked as Rejected.")
+                            st.rerun()
+                        elif result == "returned":
+                            st.success(f"{batch_no} marked as Returned for Correction.")
+                            st.rerun()
+
+            elif module == "GRN Receiving":
+                grn_no = req_row["record_id"]
+                grn_rows = query("SELECT * FROM goods_receipts WHERE grn_no=?", (grn_no,))
+                if grn_rows.empty:
+                    st.error("This GRN record could not be found.")
+                else:
+                    grn = grn_rows.iloc[0]
+                    st.dataframe(grn_rows[[
+                        "grn_no","grn_date","po_no","supplier_name","item_name",
+                        "ordered_qty","received_qty","rejected_qty","accepted_qty","warehouse","remarks"
+                    ]], use_container_width=True, hide_index=True)
+
+                    decision = st.radio("Decision", ["Approve", "Reject"], horizontal=True, key="grn_decision")
+                    comments = st.text_area("Comments", key="grn_comments")
+
+                    if st.button("Submit Decision", type="primary", key="grn_submit"):
+                        if not approvals.is_step_pending(query, int(req_row["step_id"])):
+                            st.error("This request was already processed by another approver. Refresh the inbox.")
+                            st.rerun()
+                        elif decision == "Reject" and not comments.strip():
+                            st.error("Comments are required for rejection.")
+                        else:
+                            now = datetime.now().isoformat(timespec="seconds")
+                            grn_error = None
+                            result = None
+                            try:
+                                with conn() as c:
+                                    result = approvals.act_on_step_conn(c, request_id, int(req_row["step_id"]), decision,
+                                                                         comments, user["full_name"], user["username"])
+                                    if result == "final_approved":
+                                        po_row = query("SELECT * FROM purchase_orders WHERE po_no=?", (grn["po_no"],)).iloc[0]
+                                        accepted = float(grn["accepted_qty"] or 0)
+                                        current_qty = float(scalar(
+                                            "SELECT opening_qty+received_qty-issued_qty FROM inventory WHERE item_code=?",
+                                            (grn["item_code"],), default=0
+                                        ))
+                                        c.execute(
+                                            """UPDATE inventory SET received_qty=received_qty+?, unit_cost=?
+                                               WHERE item_code=?""",
+                                            (accepted, float(po_row["unit_cost"]), grn["item_code"])
+                                        )
+                                        c.execute(
+                                            """INSERT INTO inventory_audit_log(
+                                                batch_no,item_code,item_name,transaction_type,before_qty,change_qty,
+                                                after_qty,unit_cost,value_impact,reason,action_by,action_username,
+                                                action_at,approval_by,approval_at
+                                            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                            (
+                                                grn_no, grn["item_code"], grn["item_name"], "GRN Receiving",
+                                                current_qty, accepted, current_qty+accepted, float(po_row["unit_cost"]),
+                                                accepted*float(po_row["unit_cost"]), grn["remarks"],
+                                                req_row["submitted_by"], "", req_row["submitted_at"], user["full_name"], now
+                                            )
+                                        )
+                                        c.execute("UPDATE goods_receipts SET status='Posted' WHERE grn_no=?", (grn_no,))
+                                        total_posted = float(c.execute(
+                                            "SELECT COALESCE(SUM(accepted_qty),0) FROM goods_receipts WHERE po_no=? AND status='Posted'",
+                                            (grn["po_no"],)
+                                        ).fetchone()[0])
+                                        new_po_status = "Received" if total_posted >= float(po_row["qty"])-0.0001 else "Partially Received"
+                                        c.execute(
+                                            "UPDATE purchase_orders SET status=?, received_at=?, grn_no=? WHERE po_no=?",
+                                            (new_po_status, now, grn_no, grn["po_no"])
+                                        )
+                                    elif result == "rejected":
+                                        c.execute("UPDATE goods_receipts SET status='Rejected' WHERE grn_no=?", (grn_no,))
+                                    c.commit()
+                            except Exception as e:
+                                grn_error = str(e)
+
+                            if grn_error:
+                                st.error(f"Approval could not be completed and was rolled back: {grn_error}")
+                            elif result == "final_approved":
+                                st.success(f"{grn_no} approved and posted to inventory.")
+                                st.rerun()
+                            elif result == "next_level":
+                                st.success(f"{grn_no} approved at this level — advanced to the next approver.")
+                                st.rerun()
+                            elif result == "rejected":
+                                st.success(f"{grn_no} rejected. No stock was posted.")
+                                st.rerun()
+
+            elif module == "Opening Stock":
+                item_code = req_row["record_id"]
+                req_details = query("SELECT * FROM opening_stock_requests WHERE item_code=?", (item_code,))
+                if req_details.empty:
+                    st.error("This opening stock request could not be found.")
+                else:
+                    detail = req_details.iloc[0]
+                    st.dataframe(req_details[["item_code","item_name","requested_qty","requested_by","requested_at"]],
+                                 use_container_width=True, hide_index=True)
+
+                    decision = st.radio("Decision", ["Approve", "Reject"], horizontal=True, key="opening_decision")
+                    comments = st.text_area("Comments", key="opening_comments")
+
+                    if st.button("Submit Decision", type="primary", key="opening_submit"):
+                        if not approvals.is_step_pending(query, int(req_row["step_id"])):
+                            st.error("This request was already processed by another approver. Refresh the inbox.")
+                            st.rerun()
+                        elif decision == "Reject" and not comments.strip():
+                            st.error("Comments are required for rejection.")
+                        else:
+                            now = datetime.now().isoformat(timespec="seconds")
+                            opening_error = None
+                            result = None
+                            try:
+                                with conn() as c:
+                                    result = approvals.act_on_step_conn(c, request_id, int(req_row["step_id"]), decision,
+                                                                         comments, user["full_name"], user["username"])
+                                    if result == "final_approved":
+                                        unit_cost = float(c.execute("SELECT unit_cost FROM inventory WHERE item_code=?", (item_code,)).fetchone()[0] or 0)
+                                        c.execute("UPDATE inventory SET opening_qty=? WHERE item_code=?", (float(detail["requested_qty"]), item_code))
+                                        c.execute(
+                                            """INSERT INTO inventory_audit_log(
+                                                batch_no,item_code,item_name,transaction_type,before_qty,change_qty,
+                                                after_qty,unit_cost,value_impact,reason,action_by,action_username,
+                                                action_at,approval_by,approval_at
+                                            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                            (
+                                                f"OPEN-{item_code}", item_code, detail["item_name"], "Opening Stock",
+                                                0, float(detail["requested_qty"]), float(detail["requested_qty"]), unit_cost,
+                                                float(detail["requested_qty"])*unit_cost, "Initial opening balance",
+                                                detail["requested_by"], detail["requested_username"], detail["requested_at"],
+                                                user["full_name"], now
+                                            )
+                                        )
+                                        c.execute("UPDATE opening_stock_requests SET status='Approved' WHERE item_code=?", (item_code,))
+                                    elif result == "rejected":
+                                        c.execute("UPDATE opening_stock_requests SET status='Rejected' WHERE item_code=?", (item_code,))
+                                    c.commit()
+                            except Exception as e:
+                                opening_error = str(e)
+
+                            if opening_error:
+                                st.error(f"Approval could not be completed and was rolled back: {opening_error}")
+                            elif result == "final_approved":
+                                st.success(f"Opening stock for {detail['item_name']} approved and posted.")
+                                st.rerun()
+                            elif result == "next_level":
+                                st.success("Opening stock request approved at this level — advanced to the next approver.")
+                                st.rerun()
+                            elif result == "rejected":
+                                st.success(f"Opening stock request for {detail['item_name']} rejected. Item remains at zero stock.")
+                                st.rerun()
+            else:
+                st.info("Unrecognized request module.")
+    with tab5:
+        st.subheader("Pending Approval — All Requests")
+        st.caption("Every open request across all approvers, for managers wanting the full picture.")
+        pending = approvals.get_pending(query)
+        if pending.empty:
+            st.info("Nothing is currently pending.")
+        else:
+            st.dataframe(pending, use_container_width=True, hide_index=True)
+
+    with tab6:
+        st.subheader("My Submitted Requests")
+        mine = approvals.get_my_requests(query, user["username"])
+        if mine.empty:
+            st.info("You haven't submitted any requests yet.")
+        else:
+            st.dataframe(mine, use_container_width=True, hide_index=True)
+
+    with tab7:
+        st.subheader("Approval History")
+        history = approvals.get_history(query)
+        if history.empty:
+            st.info("No approval decisions recorded yet.")
+        else:
+            st.dataframe(history, use_container_width=True, hide_index=True)
+
+    with tab8:
+        st.subheader("Loss Prevention / Internal Audit Dashboard")
+        batches = query("SELECT * FROM stock_adjustment_batches")
+        audit = query("SELECT * FROM inventory_audit_log ORDER BY action_at DESC")
+        c1,c2,c3,c4,c5 = st.columns(5)
+        c1.metric("Pending", int((batches["status"]=="Pending Approval").sum()) if not batches.empty else 0)
+        c2.metric("Posted", int((batches["status"]=="Posted").sum()) if not batches.empty else 0)
+        c3.metric("Rejected", int((batches["status"]=="Rejected").sum()) if not batches.empty else 0)
+        c4.metric("Stock Loss Value", money(abs(audit.loc[audit["value_impact"]<0,"value_impact"].sum())) if not audit.empty else money(0))
+        c5.metric("Stock Gain Value", money(audit.loc[audit["value_impact"]>0,"value_impact"].sum()) if not audit.empty else money(0))
+
+        if audit.empty:
+            st.info("No approved stock adjustment audit records yet.")
+        else:
+            st.markdown("### High-Value and Recent Adjustments")
+            audit_view = audit.copy()
+            audit_view["absolute_value"] = audit_view["value_impact"].abs()
+            st.dataframe(audit_view.sort_values("absolute_value", ascending=False).head(50), use_container_width=True, hide_index=True)
+            st.markdown("### Top Adjusted Items by Value")
+            top_items = audit.groupby("item_name", as_index=False).agg(
+                net_quantity=("change_qty","sum"),
+                net_value=("value_impact","sum"),
+                adjustment_count=("audit_id","count")
+            ).sort_values("adjustment_count", ascending=False)
+            st.dataframe(top_items, use_container_width=True, hide_index=True)
+            st.markdown("### User Activity")
+            users_activity = audit.groupby(["action_by","approval_by"], as_index=False).agg(
+                batches=("batch_no","nunique"),
+                lines=("audit_id","count"),
+                value_impact=("value_impact","sum")
+            )
+            st.dataframe(users_activity, use_container_width=True, hide_index=True)
+            st.download_button(
+                "Download Complete LP Audit Trail",
+                data=excel_file({"Batches": batches, "Audit Log": audit, "Top Items": top_items}),
+                file_name="Hotel_ERP_LP_Inventory_Audit.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary"
+            )
 
 # ---------------- Purchasing ----------------
 elif page == "Purchasing":
@@ -826,7 +1727,7 @@ elif page == "Purchasing":
         "Approval Queue",
         "Goods Receipt (GRN)",
         "Invoice Booking",
-        "PO Payments",
+        "Invoice Payments",
         "Cancel PO"
     ])
 
@@ -881,11 +1782,11 @@ elif page == "Purchasing":
                 subtotal=qty*unit_cost
                 vat_amount=subtotal*vat_rate/100
                 total=subtotal+vat_amount
-                approval_level=required_approval(total)
-
+                chain = approvals.approval_chain_for_value(total)
+                approval_level_display = " → ".join(chain)
                 st.info(
                     f"Subtotal: {money(subtotal)} | VAT: {money(vat_amount)} | "
-                    f"Total: {money(total)} | Required approval: {approval_level}"
+                    f"Total: {money(total)} | Approval chain: {approval_level_display}"
                 )
                 submit=st.form_submit_button("Create & Submit PO",type="primary")
 
@@ -895,18 +1796,28 @@ elif page == "Purchasing":
                     """INSERT INTO purchase_orders(
                         po_no,po_date,supplier_id,supplier_name,item_code,item_name,
                         qty,unit_cost,vat_rate,total,status,payment_method,
-                        payment_terms_days,requested_by,approval_level,approved_by,
+                        payment_terms_days,requested_by,requested_username,approval_level,approved_by,
                         approved_at,rejection_reason,payment_status,paid_amount,
                         received_at,grn_no,invoice_status
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         po,str(date.today()),supplier_row["supplier_id"],supplier_name,
                         item_row["item_code"],item,qty,unit_cost,vat_rate,total,
-                        "Pending Approval",payment_method,payment_terms,user["full_name"],
-                        approval_level,"","","","Unpaid",0.0,"","","Not Booked"
+                        "Pending Approval",payment_method,payment_terms,user["full_name"],user["username"],
+                        approval_level_display,"","","","Unpaid",0.0,"","","Not Booked"
                     )
                 )
-                st.success(f"{po} submitted for {approval_level} approval.")
+                approvals.submit_request(
+                    execute, scalar,
+                    module="Purchase Order",
+                    record_id=po,
+                    title=f"Purchase Order {po} — {item} ({money(total)})",
+                    submitted_by=user["full_name"],
+                    submitted_username=user["username"],
+                    approver_chain=chain,
+                    sla_hours=24
+                )
+                st.success(f"{po} submitted for approval ({approval_level_display}).")
                 st.rerun()
 
         st.dataframe(
@@ -919,69 +1830,108 @@ elif page == "Purchasing":
 
     with tab3:
         st.subheader("Approval Queue")
-        queue=query("""
-            SELECT * FROM purchase_orders
+        st.caption(
+            "You cannot approve a purchase order you created yourself. Higher-value POs require "
+            "sequential approval through Manager, then Accounts, then Admin."
+        )
+
+        full_status = query("SELECT status FROM purchase_orders")
+        c1,c2,c3,c4=st.columns(4)
+        c1.metric("Pending Approval", int((full_status["status"]=="Pending Approval").sum()) if not full_status.empty else 0)
+        c2.metric("Approved", int((full_status["status"]=="Approved").sum()) if not full_status.empty else 0)
+        c3.metric("Received", int((full_status["status"]=="Received").sum()) if not full_status.empty else 0)
+        c4.metric("Rejected", int((full_status["status"]=="Rejected").sum()) if not full_status.empty else 0)
+
+        queue_display=query("""
+            SELECT po_no,po_date,supplier_name,item_name,qty,total,status,
+                   approval_level,requested_by,approved_by,grn_no,invoice_status
+            FROM purchase_orders
             WHERE status IN ('Pending Approval','Approved','Rejected','Partially Received','Received','Cancelled')
             ORDER BY po_no DESC
         """)
-
-        if queue.empty:
+        if queue_display.empty:
             st.info("No purchase orders available.")
         else:
-            role=user["role"]
-            approvable=queue[
-                (queue["status"]=="Pending Approval") &
-                ((queue["approval_level"]==role) | (role=="Admin"))
-            ]
+            st.dataframe(queue_display, use_container_width=True, hide_index=True)
 
-            c1,c2,c3,c4=st.columns(4)
-            c1.metric("Pending Approval",int((queue["status"]=="Pending Approval").sum()))
-            c2.metric("Approved",int((queue["status"]=="Approved").sum()))
-            c3.metric("Received",int((queue["status"]=="Received").sum()))
-            c4.metric("Rejected",int((queue["status"]=="Rejected").sum()))
+        inbox_raw = approvals.get_inbox(query, user["username"], user["role"])
+        inbox = inbox_raw[inbox_raw["module"]=="Purchase Order"] if not inbox_raw.empty else inbox_raw
 
-            st.dataframe(
-                queue[["po_no","supplier_name","item_name","qty","total","status",
-                       "approval_level","requested_by","approved_by","grn_no","invoice_status"]],
-                use_container_width=True,
-                hide_index=True
-            )
+        if inbox.empty:
+            st.info("No purchase orders are awaiting your approval level (or your own submissions are excluded).")
+        else:
+            st.dataframe(inbox, use_container_width=True, hide_index=True)
+            selected_request=st.selectbox("Select Request", inbox["request_id"].tolist(), key="po_inbox_request")
+            req_row=inbox[inbox["request_id"]==selected_request].iloc[0]
+            selected_po=req_row["record_id"]
 
-            if not approvable.empty:
-                selected_po=st.selectbox("PO Number",approvable["po_no"].tolist())
-                decision=st.radio("Decision",["Approve","Reject"],horizontal=True)
-                rejection_reason=st.text_area("Rejection Reason",disabled=(decision=="Approve"))
+            decision=st.radio("Decision",["Approve","Reject"],horizontal=True,key="po_decision")
+            rejection_reason=st.text_area("Rejection Reason",disabled=(decision=="Approve"),key="po_rejection_reason")
 
-                if st.button("Submit Decision",type="primary"):
-                    if decision=="Reject" and not rejection_reason.strip():
-                        st.error("Rejection reason is required.")
-                    else:
-                        now=datetime.now().isoformat(timespec="seconds")
-                        if decision=="Approve":
-                            execute(
-                                """UPDATE purchase_orders
-                                   SET status='Approved',approved_by=?,approved_at=?,rejection_reason=''
-                                   WHERE po_no=?""",
-                                (user["full_name"],now,selected_po)
-                            )
-                            st.success(f"{selected_po} approved.")
-                        else:
-                            execute(
-                                """UPDATE purchase_orders
-                                   SET status='Rejected',approved_by=?,approved_at=?,rejection_reason=?
-                                   WHERE po_no=?""",
-                                (user["full_name"],now,rejection_reason.strip(),selected_po)
-                            )
-                            st.success(f"{selected_po} rejected.")
+            if st.button("Submit Decision",type="primary",key="po_submit_decision"):
+                if not approvals.is_step_pending(query, int(req_row["step_id"])):
+                    st.error("This request was already processed by another approver. Refresh the queue.")
+                    st.rerun()
+                elif decision=="Reject" and not rejection_reason.strip():
+                    st.error("Rejection reason is required.")
+                else:
+                    now=datetime.now().isoformat(timespec="seconds")
+                    po_error=None
+                    result=None
+                    with st.spinner("Recording decision..."):
+                        try:
+                            with conn() as c:
+                                result = approvals.act_on_step_conn(
+                                    c, selected_request, int(req_row["step_id"]), decision,
+                                    rejection_reason.strip() if decision=="Reject" else "",
+                                    user["full_name"], user["username"]
+                                )
+                                if result=="rejected":
+                                    c.execute(
+                                        """UPDATE purchase_orders
+                                           SET status='Rejected',approved_by=?,approved_at=?,rejection_reason=?
+                                           WHERE po_no=?""",
+                                        (user["full_name"],now,rejection_reason.strip(),selected_po)
+                                    )
+                                elif result=="final_approved":
+                                    c.execute(
+                                        """UPDATE purchase_orders
+                                           SET status='Approved',approved_by=?,approved_at=?,rejection_reason=''
+                                           WHERE po_no=?""",
+                                        (user["full_name"],now,selected_po)
+                                    )
+                                elif result=="next_level":
+                                    c.execute(
+                                        """UPDATE purchase_orders
+                                           SET approved_by=?,approved_at=?
+                                           WHERE po_no=?""",
+                                        (user["full_name"],now,selected_po)
+                                    )
+                                affected = 1
+                                c.commit()
+                        except Exception as e:
+                            po_error=str(e)
+
+                    if po_error:
+                        st.error(po_error)
+                    elif result=="rejected":
+                        st.success(f"{selected_po} rejected.")
                         st.rerun()
-            else:
-                st.info("No purchase orders are awaiting your approval level.")
+                    elif result=="final_approved":
+                        st.success(f"{selected_po} fully approved.")
+                        st.rerun()
+                    elif result=="next_level":
+                        st.success(f"{selected_po} approved at this level — advanced to the next approver.")
+                        st.rerun()
 
     with tab4:
         st.subheader("Goods Receipt Note (GRN / GRR)")
         approved=query("""
             SELECT po.*,
-                   COALESCE((SELECT SUM(accepted_qty) FROM goods_receipts gr WHERE gr.po_no=po.po_no),0) AS already_received
+                   COALESCE((SELECT SUM(accepted_qty) FROM goods_receipts gr
+                             WHERE gr.po_no=po.po_no AND gr.status='Posted'),0) AS already_received,
+                   COALESCE((SELECT SUM(accepted_qty) FROM goods_receipts gr
+                             WHERE gr.po_no=po.po_no AND gr.status='Pending Approval'),0) AS pending_received
             FROM purchase_orders po
             WHERE po.status IN ('Approved','Partially Received')
             ORDER BY po.po_no
@@ -992,7 +1942,7 @@ elif page == "Purchasing":
         else:
             po_no=st.selectbox("Approved PO",approved["po_no"].tolist())
             row=approved[approved["po_no"]==po_no].iloc[0]
-            outstanding=float(row["qty"])-float(row["already_received"])
+            outstanding=float(row["qty"])-float(row["already_received"])-float(row["pending_received"])
 
             c1,c2,c3,c4=st.columns(4)
             c1.metric("Ordered Qty",f"{float(row['qty']):,.2f}")
@@ -1006,7 +1956,7 @@ elif page == "Purchasing":
                 rejected_qty=c2.number_input("Rejected Quantity",min_value=0.0,max_value=float(received_qty),value=0.0)
                 warehouse=c3.selectbox("Warehouse",["Main Store","Kitchen Store","Housekeeping Store","Maintenance Store"])
                 remarks=st.text_area("GRN Remarks")
-                create_grn=st.form_submit_button("Create GRN & Update Stock",type="primary")
+                create_grn=st.form_submit_button("Create GRN & Submit for Approval",type="primary")
 
             if create_grn:
                 accepted_qty=float(received_qty)-float(rejected_qty)
@@ -1022,31 +1972,24 @@ elif page == "Purchasing":
                             grn_no,str(date.today()),po_no,row["supplier_name"],row["item_code"],
                             row["item_name"],float(row["qty"]),float(received_qty),
                             float(rejected_qty),accepted_qty,warehouse,user["full_name"],
-                            remarks,"Posted"
+                            remarks,"Pending Approval"
                         )
                     )
-
-                    if accepted_qty > 0:
-                        execute(
-                            """UPDATE inventory
-                               SET received_qty=received_qty+?, unit_cost=?
-                               WHERE item_code=?""",
-                            (accepted_qty,float(row["unit_cost"]),row["item_code"])
-                        )
-
-                    total_received=float(row["already_received"])+accepted_qty
-                    new_status="Received" if total_received >= float(row["qty"])-0.0001 else "Partially Received"
-
-                    execute(
-                        """UPDATE purchase_orders
-                           SET status=?,received_at=?,grn_no=?
-                           WHERE po_no=?""",
-                        (new_status,datetime.now().isoformat(timespec="seconds"),grn_no,po_no)
+                    grn_value = accepted_qty * float(row["unit_cost"])
+                    chain = approvals.approval_chain_for_value(grn_value)
+                    approvals.submit_request(
+                        execute, scalar,
+                        module="GRN Receiving",
+                        record_id=grn_no,
+                        title=f"Goods receipt {grn_no} — {row['item_name']} ({accepted_qty:.2f}, {money(grn_value)})",
+                        submitted_by=user["full_name"],
+                        submitted_username=user["username"],
+                        approver_chain=chain,
+                        sla_hours=24
                     )
-
                     st.success(
-                        f"{grn_no} posted. Accepted stock {accepted_qty:.2f} "
-                        f"added to stock on hand."
+                        f"{grn_no} submitted for approval ({' → '.join(chain)}). Stock has not been "
+                        f"added to inventory yet — it will update once fully approved."
                     )
                     st.rerun()
 
@@ -1091,7 +2034,9 @@ elif page == "Purchasing":
             FROM purchase_orders po
             JOIN goods_receipts gr ON gr.po_no=po.po_no
             WHERE po.status IN ('Received','Partially Received')
-              AND po.invoice_status!='Booked'
+              AND NOT EXISTS (
+                  SELECT 1 FROM supplier_invoices si WHERE si.grn_no = gr.grn_no
+              )
             ORDER BY po.po_no
         """)
 
@@ -1103,17 +2048,22 @@ elif page == "Purchasing":
                 axis=1
             )
             selected_label=st.selectbox("PO / GRN",received_pos["po_grn_label"].tolist())
-            po_no=selected_label.split(" | ")[0]
-            row=received_pos[received_pos["po_no"]==po_no].iloc[0]
+            # Matched on the FULL label, not just po_no — a PO can have multiple
+            # GRNs (partial receipts), and matching on po_no alone would always
+            # resolve to the first GRN row regardless of which one was picked.
+            row=received_pos[received_pos["po_grn_label"]==selected_label].iloc[0]
+            po_no=row["po_no"]
 
-            # Invoice value is picked from the approved PO.
-            po_qty=float(row["qty"] or 0)
+            # Only GRNs not already invoiced appear above, so each GRN can now
+            # be booked exactly once regardless of how many other GRNs exist
+            # for the same PO.
+            po_qty=float(row["accepted_qty"] or 0)
             po_unit_cost=float(row["unit_cost"] or 0)
             po_vat_rate=float(row["vat_rate"] or 0)
 
             subtotal=po_qty*po_unit_cost
             vat_amount=subtotal*po_vat_rate/100
-            total_amount=float(row["total"] or (subtotal+vat_amount))
+            total_amount=subtotal+vat_amount
 
             with st.form("invoice_booking"):
                 c1,c2,c3=st.columns(3)
@@ -1140,7 +2090,10 @@ elif page == "Purchasing":
                 else:
                     invoice_id=next_code("INVBOOK","supplier_invoices")
                     execute(
-                        """INSERT INTO supplier_invoices VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        """INSERT INTO supplier_invoices(
+                            invoice_id,invoice_no,invoice_date,po_no,grn_no,supplier_name,
+                            subtotal,vat_amount,total_amount,due_date,booked_by,booked_at,status
+                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
                             invoice_id,supplier_invoice_no.strip(),str(invoice_date),
                             po_no,str(row["receipt_grn_no"]),str(row["supplier_name"]),subtotal,
@@ -1148,9 +2101,15 @@ elif page == "Purchasing":
                             datetime.now().isoformat(timespec="seconds"),"Booked"
                         )
                     )
+                    # invoice_status reflects the PO as a whole: "Booked" only once
+                    # every GRN under this PO has its own invoice booked, otherwise
+                    # "Partially Booked" — so remaining GRNs stay bookable.
+                    total_grns = int(scalar("SELECT COUNT(*) FROM goods_receipts WHERE po_no=?", (po_no,), default=0))
+                    invoiced_grns = int(scalar("SELECT COUNT(DISTINCT grn_no) FROM supplier_invoices WHERE po_no=?", (po_no,), default=0))
+                    new_invoice_status = "Booked" if total_grns > 0 and invoiced_grns >= total_grns else "Partially Booked"
                     execute(
-                        "UPDATE purchase_orders SET invoice_status='Booked' WHERE po_no=?",
-                        (po_no,)
+                        "UPDATE purchase_orders SET invoice_status=? WHERE po_no=?",
+                        (new_invoice_status, po_no)
                     )
                     st.success(f"Invoice {supplier_invoice_no.strip()} booked successfully.")
                     st.rerun()
@@ -1159,21 +2118,26 @@ elif page == "Purchasing":
         st.dataframe(
             query("""SELECT invoice_id,invoice_no,invoice_date,po_no,grn_no,
                             supplier_name,subtotal,vat_amount,total_amount,
-                            due_date,booked_by,status
+                            due_date,booked_by,status,payment_status,paid_amount
                      FROM supplier_invoices ORDER BY booked_at DESC"""),
             use_container_width=True,
             hide_index=True
         )
 
     with tab6:
-        st.subheader("Supplier Payment Processing")
+        st.subheader("Invoice Payments")
+        st.caption(
+            "Payments are tracked per supplier invoice, not per PO — a PO with several "
+            "GRN invoices can have each one paid independently."
+        )
 
         payable=query("""
-            SELECT po.*, si.invoice_no, si.due_date, si.total_amount
-            FROM purchase_orders po
-            JOIN supplier_invoices si ON si.po_no=po.po_no
-            WHERE po.invoice_status='Booked' AND po.payment_status!='Paid'
-            ORDER BY po.supplier_name,si.due_date,po.po_no
+            SELECT invoice_id, invoice_no, invoice_date, po_no, grn_no, supplier_name,
+                   total_amount, due_date, COALESCE(payment_status,'Unpaid') AS payment_status,
+                   COALESCE(paid_amount,0) AS paid_amount, payment_reference, paid_at
+            FROM supplier_invoices
+            WHERE COALESCE(payment_status,'Unpaid') != 'Paid'
+            ORDER BY supplier_name, due_date, invoice_no
         """)
 
         if payable.empty:
@@ -1196,8 +2160,8 @@ elif page == "Purchasing":
 
             st.dataframe(
                 vendor_payable[[
-                    "po_no","invoice_no","supplier_name","due_date","total_amount",
-                    "payment_method","payment_status","paid_amount","outstanding_amount"
+                    "invoice_no","po_no","grn_no","supplier_name","due_date","total_amount",
+                    "payment_status","paid_amount","outstanding_amount"
                 ]],
                 use_container_width=True,
                 hide_index=True
@@ -1205,24 +2169,22 @@ elif page == "Purchasing":
 
             vendor_payable["payment_label"]=vendor_payable.apply(
                 lambda r: (
-                    f"{r['po_no']} | Inv {r['invoice_no']} | "
+                    f"Inv {r['invoice_no']} | PO {r['po_no']} | GRN {r['grn_no']} | "
                     f"Outstanding {money(r['outstanding_amount'])}"
                 ),
                 axis=1
             )
 
             selected_labels=st.multiselect(
-                "Select Multiple Invoices / POs for Payment",
+                "Select Multiple Invoices for Payment",
                 vendor_payable["payment_label"].tolist()
             )
 
-            selected_po_numbers=[
-                label.split(" | ")[0]
-                for label in selected_labels
-            ]
-
+            # Matched on the full label (which encodes invoice_id-unique info)
+            # rather than splitting a string — avoids any ambiguity between
+            # invoices that share the same PO or GRN prefix.
             selected_rows=vendor_payable[
-                vendor_payable["po_no"].isin(selected_po_numbers)
+                vendor_payable["payment_label"].isin(selected_labels)
             ]
 
             selected_total=float(
@@ -1265,15 +2227,16 @@ elif page == "Purchasing":
             )
 
             if st.button(
-                "Record Vendor Batch Payment",
+                "Record Invoice Payment",
                 type="primary",
                 disabled=(selected_total <= 0)
             ):
                 remaining=float(payment_amount)
                 paid_items=[]
+                touched_po_nos=set()
 
                 allocation_rows=selected_rows.sort_values(
-                    ["due_date","po_no"]
+                    ["due_date","invoice_no"]
                 )
 
                 for _, inv_row in allocation_rows.iterrows():
@@ -1289,22 +2252,28 @@ elif page == "Purchasing":
                     else:
                         new_status="Partially Paid"
 
+                    now=datetime.now().isoformat(timespec="seconds")
                     execute(
-                        """UPDATE purchase_orders
-                           SET paid_amount=?,payment_status=?,payment_method=?
-                           WHERE po_no=?""",
+                        """UPDATE supplier_invoices
+                           SET paid_amount=?,payment_status=?,payment_reference=?,paid_at=?
+                           WHERE invoice_id=?""",
                         (
                             new_paid,
                             new_status,
-                            payment_method,
-                            inv_row["po_no"]
+                            payment_reference.strip(),
+                            now,
+                            inv_row["invoice_id"]
                         )
                     )
 
                     paid_items.append(
-                        f"{inv_row['po_no']}:{allocated:.2f}"
+                        f"{inv_row['invoice_no']}:{allocated:.2f}"
                     )
+                    touched_po_nos.add(inv_row["po_no"])
                     remaining-=allocated
+
+                for touched_po in touched_po_nos:
+                    sync_po_payment_rollup(touched_po)
 
                 pid=next_code("PAY","payments")
                 reference_text=payment_reference.strip() or ", ".join(paid_items)
@@ -1318,12 +2287,12 @@ elif page == "Purchasing":
                         selected_vendor,
                         payment_method,
                         float(payment_amount),
-                        "Vendor Batch Payment"
+                        "Vendor Invoice Payment"
                     )
                 )
 
                 st.success(
-                    f"Batch payment of {money(payment_amount)} recorded for "
+                    f"Payment of {money(payment_amount)} recorded for "
                     f"{selected_vendor} across {len(paid_items)} invoice(s)."
                 )
                 st.rerun()
@@ -1362,7 +2331,7 @@ elif page == "Purchasing":
                 row=active_pos[active_pos["po_no"]==selected_po].iloc[0]
 
                 has_grn=bool(str(row["grn_no"] or "").strip())
-                invoice_booked=str(row["invoice_status"] or "")=="Booked"
+                invoice_booked=str(row["invoice_status"] or "") in ["Booked","Partially Booked"]
                 paid_amount=float(row["paid_amount"] or 0)
                 payment_done=paid_amount > 0 or str(row["payment_status"] or "") in ["Partially Paid","Paid"]
                 received_status=str(row["status"]) in ["Partially Received","Received"]
@@ -1525,9 +2494,13 @@ elif page == "Reports":
         "Inventory":stock_df(),
         "Suppliers":query("SELECT * FROM suppliers"),
         "Purchase Orders":query("SELECT * FROM purchase_orders"),
+        "Supplier Invoices":query("SELECT * FROM supplier_invoices"),
         "Payments":query("SELECT * FROM payments"),
         "Expenses":query("SELECT * FROM expenses"),
-        "Maintenance":query("SELECT * FROM maintenance")
+        "Maintenance":query("SELECT * FROM maintenance"),
+        "Stock Adj Batches":query("SELECT * FROM stock_adjustment_batches"),
+        "Stock Adj Lines":query("SELECT * FROM stock_adjustment_lines"),
+        "Inventory Audit":query("SELECT * FROM inventory_audit_log")
     }
     st.download_button(
         "Download Complete Hotel ERP Report",
@@ -1537,3 +2510,4 @@ elif page == "Reports":
         type="primary"
     )
     st.success("The SQLite database keeps your data after the application closes.")
+
