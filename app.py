@@ -137,11 +137,27 @@ h1 {
 [data-testid="stAlert"] { border-radius: 12px; }
 hr { border-color: #e2e8f0; }
 
-/* Login screen polish */
-.block-container { padding-top: 2rem; padding-bottom: 3rem; }
-@media (max-width: 900px) {
-    .block-container { padding-left: 1rem; padding-right: 1rem; }
-}
+/* Premium application shell */
+.block-container { padding-top: 1.25rem; padding-bottom: 3rem; max-width: 1500px; }
+[data-testid="stHeader"] { background: rgba(255,255,255,.72); backdrop-filter: blur(12px); border-bottom: 1px solid rgba(226,232,240,.8); }
+[data-testid="stToolbar"] { right: 1rem; }
+.erp-brand-card { padding: 1rem 1rem .9rem; margin: .2rem 0 .9rem; border-radius: 18px; background: linear-gradient(135deg, rgba(59,130,246,.28), rgba(6,182,212,.12)); border: 1px solid rgba(255,255,255,.16); box-shadow: 0 12px 30px rgba(2,8,23,.20); }
+.erp-brand-name { font-size: 1.35rem; font-weight: 850; color: #fff; letter-spacing: -.02em; }
+.erp-brand-sub { color: #bfdbfe; font-size: .82rem; margin-top: .18rem; }
+.erp-user-chip { margin: .4rem 0 1rem; padding: .7rem .8rem; border-radius: 13px; background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.10); }
+[data-testid="stSidebar"] .stRadio > div { gap: .12rem; }
+[data-testid="stSidebar"] .stRadio label { min-height: 2.45rem; border: 1px solid transparent; }
+[data-testid="stSidebar"] .stRadio label:has(input:checked) { background: linear-gradient(90deg, rgba(59,130,246,.45), rgba(6,182,212,.22)); border-color: rgba(147,197,253,.35); box-shadow: 0 7px 18px rgba(2,8,23,.22); }
+[data-testid="stSidebar"] .stRadio input { display: none; }
+.main h1 { font-size: 2.35rem !important; margin-bottom: 1.2rem !important; }
+[data-testid="stDownloadButton"] button { background: linear-gradient(90deg, #7c3aed, #2563eb) !important; min-height: 2.8rem; }
+[data-testid="stMetric"] { position: relative; overflow: hidden; }
+[data-testid="stMetric"]:before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 5px; background: linear-gradient(180deg, #2563eb, #06b6d4); }
+.erp-hero { display: flex; justify-content: space-between; align-items: center; gap: 1rem; padding: 1.1rem 1.25rem; margin: 0 0 1.1rem; border-radius: 18px; color: #fff; background: linear-gradient(120deg, #172554 0%, #1d4ed8 58%, #0891b2 100%); box-shadow: 0 18px 40px rgba(37,99,235,.18); }
+.erp-hero-title { font-size: 1.15rem; font-weight: 800; }
+.erp-hero-copy { color: #dbeafe; font-size: .88rem; margin-top: .15rem; }
+.erp-live { padding: .35rem .65rem; border-radius: 999px; background: rgba(255,255,255,.14); border:1px solid rgba(255,255,255,.2); white-space: nowrap; }
+@media (max-width: 900px) { .block-container { padding-left: .8rem; padding-right: .8rem; } .main h1 { font-size: 1.8rem !important; } .erp-hero { align-items:flex-start; flex-direction:column; } }
 </style>
 """, unsafe_allow_html=True)
 
@@ -807,10 +823,18 @@ if not st.session_state.user:
     st.stop()
 
 user = st.session_state.user
-st.sidebar.markdown("## 🏨 Hotel ERP")
-st.sidebar.markdown(f"**👤 {user['full_name']}**")
-st.sidebar.caption(f"Role: {user['role']}")
-st.sidebar.divider()
+st.sidebar.markdown("""
+<div class="erp-brand-card">
+  <div class="erp-brand-name">🏨 Hotel ERP</div>
+  <div class="erp-brand-sub">Operations • Finance • Guest Experience</div>
+</div>
+""", unsafe_allow_html=True)
+st.sidebar.markdown(
+    f"""<div class="erp-user-chip"><strong>👤 {user['full_name']}</strong><br>
+    <span style="color:#bfdbfe;font-size:.82rem">{user['role']} access</span></div>""",
+    unsafe_allow_html=True
+)
+st.sidebar.markdown("<div style='color:#93c5fd;font-size:.72rem;font-weight:800;letter-spacing:.12em;margin:.2rem 0 .35rem'>NAVIGATION</div>", unsafe_allow_html=True)
 
 visible_pages = [p for p in ALL_MODULES if page_allowed(user["username"], p, user["role"])]
 
@@ -827,6 +851,14 @@ if st.sidebar.button("Logout"):
     st.session_state.user = None
     st.rerun()
 
+st.markdown(
+    f"""<div class="erp-hero">
+      <div><div class="erp-hero-title">{MODULE_ICONS.get(page, '🏨')} {page}</div>
+      <div class="erp-hero-copy">Hotel operations control center • {datetime.now().strftime('%A, %d %B %Y')}</div></div>
+      <div class="erp-live">● Live workspace</div>
+    </div>""",
+    unsafe_allow_html=True
+)
 
 # ---------------- User Access ----------------
 if page == "User Access":
