@@ -1,0 +1,26 @@
+HOTEL ERP ENTERPRISE UI DEMO
+
+1. Copy both files into:
+   C:\Hotel_Control_Tower_Enterprise_Final\
+
+2. Required files in the same folder:
+   - Hotel_ERP_Enterprise_UI_Demo.py
+   - hotel_erp.db
+
+3. Install requirements:
+   pip install streamlit pandas openpyxl
+
+4. Run:
+   streamlit run Hotel_ERP_Enterprise_UI_Demo.py
+
+5. This first enterprise UI build includes:
+   - Commercial dark sidebar
+   - Top navigation bar
+   - Reservation KPI cards
+   - Reservation filters
+   - Live reservation table using hotel_erp.db
+   - Excel export
+   - Full menu shell for all planned modules
+   - Responsive desktop layout
+
+The Reservations module is fully connected. Other menu items are prepared as enterprise placeholders for the next migration phase.
