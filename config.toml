@@ -1,17 +1,15 @@
-[server]
-headless = true
-address = "0.0.0.0"
-port = 8501
-enableCORS = false
-enableXsrfProtection = true
+Upload/replace these files in the ROOT of your GitHub repository:
 
-[browser]
-gatherUsageStats = false
+1. app.py
+2. approvals.py
+3. requirements.txt
+4. runtime.txt
+5. hotel_erp.db
+6. .streamlit/config.toml (optional but included)
 
-[theme]
-base = "light"
-primaryColor = "#FF4B4B"
-backgroundColor = "#FFFFFF"
-secondaryBackgroundColor = "#F3F5F8"
-textColor = "#1F2937"
-font = "sans serif"
+Streamlit Cloud settings:
+Repository: brsrinimur-rgb/Hotel-ERP-Demo
+Branch: main
+Main file path: app.py
+
+After upload, commit changes and reboot the Streamlit app.
