@@ -1,15 +1,16 @@
-Upload/replace these files in the ROOT of your GitHub repository:
+[server]
+headless = true
+enableCORS = false
+enableXsrfProtection = true
+maxUploadSize = 200
 
-1. app.py
-2. approvals.py
-3. requirements.txt
-4. runtime.txt
-5. hotel_erp.db
-6. .streamlit/config.toml (optional but included)
+[browser]
+gatherUsageStats = false
 
-Streamlit Cloud settings:
-Repository: brsrinimur-rgb/Hotel-ERP-Demo
-Branch: main
-Main file path: app.py
-
-After upload, commit changes and reboot the Streamlit app.
+[theme]
+base = "light"
+primaryColor = "#0D2345"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#E7F0FB"
+textColor = "#17365D"
+font = "sans serif"
