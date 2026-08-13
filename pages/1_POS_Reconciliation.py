@@ -4,6 +4,7 @@ import streamlit as st
 import importlib
 import auth, theme, core, db
 from logic import bank_settlement_extension as bank_ext
+from logic import run_history
 import report_export
 
 # Reload current core.py from disk on each page run to avoid stale Streamlit module state.
@@ -289,7 +290,32 @@ if st.button("RUN RECONCILIATION",type="primary",use_container_width=True):
                                     ) else pd.DataFrame(),
                                     "provider_payout_batches":r_provider_batches,
                                     "settlement_blocker_summary":bank_ext.settlement_blocker_summary(matched)}
-        st.success("Reconciliation completed and saved to the current control-tower session.")
+
+        # V28: every successful RUN RECONCILIATION creates a new, permanent Run ID and
+        # snapshots the full result under it. This never overwrites an older run - it only
+        # ever adds a new one. If run history storage itself has a problem, that must never
+        # block the live reconciliation result the user is looking at, so it's isolated in
+        # its own try/except.
+        try:
+            today_str=pd.Timestamp.today().strftime("%Y%m%d")
+            new_run_id=run_history.generate_run_id(today_str)
+            u=st.session_state.get("user") or {}
+            period_from=str(matched["Date"].min()) if not matched.empty and "Date" in matched.columns else ""
+            period_to=str(matched["Date"].max()) if not matched.empty and "Date" in matched.columns else ""
+            run_history.save_run(
+                new_run_id,st.session_state.ct_result,
+                created_at=pd.Timestamp.today().isoformat(),
+                username=u.get("username",""),user_name=u.get("name",""),
+                period_from=period_from,period_to=period_to,
+            )
+            st.session_state["current_run_id"]=new_run_id
+            st.success(f"Reconciliation completed and saved as {new_run_id}. Previous runs remain available on the Reconciliation Run History page.")
+        except Exception as run_history_error:
+            st.session_state.pop("current_run_id",None)
+            st.warning(
+                "Reconciliation completed, but it could not be saved to Run History "
+                f"({run_history_error}). The current session result above is unaffected."
+            )
     except Exception as e:
         st.exception(e)
 

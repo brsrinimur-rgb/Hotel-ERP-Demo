@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import auth, theme, core
 from logic import bank_settlement_extension as bank_ext
+from logic import run_history
 
 st.set_page_config(page_title="Settlement Batch Engine",layout="wide",page_icon="💰")
 auth.require_login({"Admin","Finance Manager","Finance Checker","Finance Maker"})
@@ -114,6 +115,18 @@ if st.button("RUN SETTLEMENT BATCH CONTROL",type="primary",use_container_width=T
     r["settlement_quarantine"]=pd.DataFrame(quarantine)
     r["settlement_stage_summary"]=core.settlement_stage_summary(updated)
     st.session_state["ct_result"]=r
+
+    # V28: this refines the CURRENT run's settlement data, so it re-saves under the SAME
+    # run_id captured when POS Reconciliation was last run (versioning that run's snapshot to
+    # its latest state) - it does not create a new run_id. If there's no current_run_id (e.g.
+    # this session predates Run History, or the initial save failed), settlement results still
+    # display normally; they just won't have a Run History entry to attach to.
+    run_id=st.session_state.get("current_run_id")
+    if run_id:
+        try:
+            run_history.save_run(run_id,r,created_at=pd.Timestamp.today().isoformat())
+        except Exception:
+            pass
 
     received=int((batch_result["Settlement Status"]=="BANK RECEIVED").sum()) if not batch_result.empty else 0
     pending=int((batch_result["Settlement Status"]=="BANK RECEIPT PENDING").sum()) if not batch_result.empty else 0
