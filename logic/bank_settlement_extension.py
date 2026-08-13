@@ -1,6 +1,9 @@
 
 """
 RetailRecon V24 — additive bank settlement propagation extension.
+V27 — bank-row identity is now fully deterministic (Source File + Source
+Sheet + Source Row + Bank Date + Bank Amount); narration text is evidence
+used for matching only, never part of a row's identity.
 
 This module does not delete or replace core.py settlement logic. It adds:
 - robust ANB / Al Rajhi statement normalization for the Finance-supplied formats;
@@ -10,7 +13,6 @@ This module does not delete or replace core.py settlement logic. It adds:
 """
 from __future__ import annotations
 import re
-import hashlib
 import numpy as np
 import pandas as pd
 
@@ -177,6 +179,28 @@ def _enhance_card_batches(batches):
     x["Transaction Count"]=pd.to_numeric(x.get("Transaction Count",np.nan),errors="coerce")
     return x
 
+
+def _bank_row_key(row):
+    """
+    V27: fully deterministic bank-row identity.
+
+    Source File + Source Sheet + Source Row + Bank Date + Bank Amount together
+    identify a single physical bank statement row. Narration/description text
+    is never part of the identity - it is evidence used for matching, not for
+    telling two bank rows apart. Both the V24+ ANB/Al Rajhi parser
+    (bank_settlement_extension.normalize_bank_statement) and the legacy
+    fallback parser (core.normalize_bank, patched in V27) stamp Bank Source
+    File / Bank Source Sheet / Bank Source Row on every row, so this key no
+    longer needs a hash-based fallback for "rows with no source metadata".
+    """
+    return "::".join([
+        _txt(row.get("Bank Source File","")),
+        _txt(row.get("Bank Source Sheet","")),
+        _txt(row.get("Bank Source Row","")),
+        _txt(row.get("Bank Date","")),
+        _txt(row.get("Bank Amount","")),
+    ])
+
 def reconcile_card_batches_to_anb(batches, bank, tolerance=1.0):
     """
     Strong ANB rule:
@@ -246,6 +270,11 @@ def reconcile_card_batches_to_anb(batches, bank, tolerance=1.0):
             "Bank Difference":round(float(sel["Bank Amount"])-exp,2) if sel is not None else np.nan,
             "Bank Reference":sel["Description"] if sel is not None else "",
             "Bank Source File":sel["Bank Source File"] if sel is not None else "",
+            # V27: carry the full identity forward so a later reservation pass
+            # (reconcile_card_batches_advanced) can recompute the exact same
+            # deterministic key instead of re-searching for it by narration text.
+            "Bank Source Sheet":sel.get("Bank Source Sheet","") if sel is not None else "",
+            "Bank Source Row":sel.get("Bank Source Row","") if sel is not None else "",
         })
         rows.append(rec)
 
@@ -308,6 +337,9 @@ def reconcile_provider_batches_to_rajhi(batches, bank, tolerance=1.0, tabby_fixe
             "Bank Difference":round(float(sel["Bank Amount"])-exp,2) if sel is not None else np.nan,
             "Bank Reference":sel["Description"] if sel is not None else "",
             "Bank Source File":sel["Bank Source File"] if sel is not None else "",
+            # V27: same full-identity audit trail as the ANB card path.
+            "Bank Source Sheet":sel.get("Bank Source Sheet","") if sel is not None else "",
+            "Bank Source Row":sel.get("Bank Source Row","") if sel is not None else "",
         })
         rows.append(rec)
 
@@ -398,3 +430,96 @@ def engine_health():
         "legacy_preserved":True,
         "extension_mode":"additive parser + batch propagation",
     }
+
+
+def reconcile_card_batches_advanced(batches, bank, tolerance=1.0):
+    base,base_unmatched=reconcile_card_batches_to_anb(batches,bank,tolerance)
+    if base is None or base.empty:
+        return base,base_unmatched
+    b=bank.copy() if bank is not None else pd.DataFrame()
+    if b.empty:
+        return base,base_unmatched
+    anb=b[(b.get("Bank","").astype(str)=="ANB") & (pd.to_numeric(b.get("Credit",0),errors="coerce").fillna(0)>0)].copy()
+    anb["_BankRowKey"]=anb.apply(_bank_row_key,axis=1)
+    used=set()
+    out=base.copy()
+
+    # Reserve uniquely matched credits.
+    # V27: reconcile_card_batches_to_anb() now carries the exact matched bank
+    # row's Source File / Source Sheet / Source Row forward on the output
+    # record (Actual Bank Amount / Bank Date are already carried). Recompute
+    # the same deterministic key directly from those fields instead of
+    # re-searching the bank pool by Description text, which could return zero
+    # or multiple candidates when two credits share identical narration.
+    for _,r in out[out["Settlement Status"].astype(str).eq("BANK RECEIVED")].iterrows():
+        used.add(_bank_row_key({
+            "Bank Source File":r.get("Bank Source File"),
+            "Bank Source Sheet":r.get("Bank Source Sheet"),
+            "Bank Source Row":r.get("Bank Source Row"),
+            "Bank Date":r.get("Bank Date"),
+            "Bank Amount":r.get("Actual Bank Amount"),
+        }))
+
+    for idx,r in out.iterrows():
+        if str(r.get("Settlement Status",""))=="BANK RECEIVED":
+            continue
+        if str(r.get("Provider","")).upper() not in {"ANB POS","AMEX"}:
+            continue
+
+        terminal=_txt(r.get("Terminal ID"))
+        pay=_norm_payment(r.get("Payment Type"))
+        sdate=pd.to_datetime(r.get("Settlement Date"),errors="coerce")
+        expected_net=float(pd.to_numeric(pd.Series([r.get("Expected Bank Amount",0)]),errors="coerce").fillna(0).iloc[0])
+        gross=float(pd.to_numeric(pd.Series([r.get("Gross Amount",0)]),errors="coerce").fillna(0).iloc[0])
+        batch_txc=pd.to_numeric(pd.Series([r.get("Transaction Count",np.nan)]),errors="coerce").iloc[0]
+
+        cand=anb[~anb["_BankRowKey"].isin(used)].copy()
+        if terminal:
+            cand=cand[cand["Narration Terminal ID"].astype(str).eq(terminal)]
+        if pay:
+            cand=cand[cand["Narration Scheme"].apply(_norm_payment).eq(pay)]
+        if pd.notna(sdate):
+            cand=cand[pd.to_datetime(cand["Narration Source Date"],errors="coerce").dt.normalize().eq(sdate.normalize())]
+        if cand.empty:
+            continue
+
+        bank_sum=float(pd.to_numeric(cand["Bank Amount"],errors="coerce").fillna(0).sum())
+        fee_sum=float(pd.to_numeric(cand.get("Narration Fee",0),errors="coerce").fillna(0).sum())
+        vat_sum=float(pd.to_numeric(cand.get("Narration VAT",0),errors="coerce").fillna(0).sum())
+        tx_sum=float(pd.to_numeric(cand.get("Narration Transaction Count",0),errors="coerce").fillna(0).sum())
+
+        if len(cand)>1 and abs(bank_sum-expected_net)<=float(tolerance):
+            used.update(cand["_BankRowKey"].tolist())
+            out.at[idx,"Settlement Status"]="BANK RECEIVED"
+            out.at[idx,"Bank Match Rule"]="ANB Aggregate: Terminal + Source Date + Scheme + Net Amount"
+            out.at[idx,"Settlement Review Reason"]=""
+            out.at[idx,"Actual Bank Amount"]=bank_sum
+            out.at[idx,"Bank Date"]=pd.to_datetime(cand["Bank Date"],errors="coerce").max()
+            out.at[idx,"Bank Difference"]=round(bank_sum-expected_net,2)
+            out.at[idx,"Bank Reference"]=" || ".join(cand["Description"].astype(str))
+            out.at[idx,"Bank Source File"]=" | ".join(sorted(set(cand["Bank Source File"].astype(str))))
+            continue
+
+        gross_bridge=bank_sum+fee_sum+vat_sum
+        count_ok=(pd.isna(batch_txc) or tx_sum==0 or abs(tx_sum-float(batch_txc))<0.001)
+        if abs(gross_bridge-gross)<=float(tolerance) and count_ok:
+            used.update(cand["_BankRowKey"].tolist())
+            out.at[idx,"Settlement Status"]="BANK RECEIVED"
+            out.at[idx,"Bank Match Rule"]="ANB Gross Proof: Bank Credit + Commission + VAT"
+            out.at[idx,"Settlement Review Reason"]=""
+            out.at[idx,"Actual Bank Amount"]=bank_sum
+            out.at[idx,"Bank Date"]=pd.to_datetime(cand["Bank Date"],errors="coerce").max()
+            out.at[idx,"Bank Difference"]=round(gross_bridge-gross,2)
+            out.at[idx,"Bank Reference"]=" || ".join(cand["Description"].astype(str))
+            out.at[idx,"Bank Source File"]=" | ".join(sorted(set(cand["Bank Source File"].astype(str))))
+            continue
+
+        out.at[idx,"Settlement Status"]="BANK REVIEW REQUIRED"
+        out.at[idx,"Bank Match Rule"]="ANB Strong Identity - Amount Proof Failed"
+        out.at[idx,"Settlement Review Reason"]=(
+            f"{len(cand)} ANB credit(s) share Terminal/Date/Scheme. "
+            f"Expected Net SAR {expected_net:,.2f}; Bank Total SAR {bank_sum:,.2f}; "
+            f"Gross Proof SAR {gross_bridge:,.2f} vs Gross SAR {gross:,.2f}."
+        )
+
+    return out,anb[~anb["_BankRowKey"].isin(used)].drop(columns=["_BankRowKey"],errors="ignore").copy()
