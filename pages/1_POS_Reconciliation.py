@@ -225,6 +225,10 @@ if st.button("RUN RECONCILIATION",type="primary",use_container_width=True):
                 # Payout discovery must not break the proven reconciliation parser.
                 pass
         r_provider_batches=pd.concat(provider_payout_parts,ignore_index=True) if provider_payout_parts else pd.DataFrame()
+        # V27: resolve TABBY Order Numbers back to specific matched transactions before
+        # settlement matching, so a BANK RECEIVED payout batch can actually flip Bank Settled
+        # on the transaction it belongs to. See core.link_tabby_payout_underlying_ids().
+        r_provider_batches=core.link_tabby_payout_underlying_ids(r_provider_batches,matched)
 
         bank=pd.concat(banks,ignore_index=True) if banks else pd.DataFrame()
 

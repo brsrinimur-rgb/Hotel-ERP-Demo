@@ -81,12 +81,17 @@ if st.button("RUN SETTLEMENT BATCH CONTROL",type="primary",use_container_width=T
                 quarantine.append({"File":f.name,"Sheet":sheet,"Reason":str(e)})
 
     provider_batches=pd.concat(payout_parts,ignore_index=True) if payout_parts else pd.DataFrame()
+    # V27: without this, a TABBY payout batch that settles BANK RECEIVED below has no way to
+    # flip the underlying matched transaction's Bank Settled flag - propagate_verified_batches()
+    # only links via an explicit Underlying IDs list or a Store/Terminal/Date fallback that TABBY
+    # payout batches (no Store Code) cannot use. See core.link_tabby_payout_underlying_ids().
+    provider_batches=core.link_tabby_payout_underlying_ids(provider_batches,matched)
     all_batches=pd.concat([x for x in [card_batches,provider_batches] if x is not None and not x.empty],ignore_index=True) if (not card_batches.empty or not provider_batches.empty) else pd.DataFrame()
     bank=pd.concat(bank_parts,ignore_index=True) if bank_parts else r.get("bank",pd.DataFrame())
 
     # Run strong ANB card matching and provider/Al Rajhi payout matching separately,
     # then combine results. Legacy core matching remains available in core.py.
-    card_result,anb_unmatched=bank_ext.reconcile_card_batches_to_anb(
+    card_result,anb_unmatched=bank_ext.reconcile_card_batches_advanced(
         card_batches,bank,tol
     )
     provider_result,rajhi_unmatched=bank_ext.reconcile_provider_batches_to_rajhi(
