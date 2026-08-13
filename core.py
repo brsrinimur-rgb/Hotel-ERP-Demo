@@ -1815,7 +1815,14 @@ def classify_settlement_source(name,df):
         return "TABBY_PAYOUT"
 
     # TAP payout/charge file: payout_id and settlement_id are critical.
-    if "payout_id" in cols and "settlement_id" in cols:
+    # V27: accept both the snake_case export form ("payout_id") and the
+    # space-separated Excel form ("payout id") - normalize_tap_payout()
+    # already tolerates both via its own find() search list, so the
+    # classifier gating it should not be stricter than the normalizer it feeds.
+    if (
+        any(c in cols for c in ["payout_id","payout id"])
+        and any(c in cols for c in ["settlement_id","settlement id"])
+    ):
         return "TAP_PAYOUT"
 
     # Generic AMEX settlement file can be extended here if payout-level columns exist.
@@ -1899,10 +1906,82 @@ def normalize_tabby_payout(df,source="Tabby Payout"):
             "VAT Amount":np.nan,
             "Expected Bank Amount":float(pd.to_numeric(g["Transferred Amount"],errors="coerce").fillna(0).sum()),
             "Order Count":int(g["Order Number"].astype(str).ne("").sum()),
+            # V27: keep the individual Order Numbers (pipe-joined) so a later step can
+            # resolve them back to specific matched transactions - see
+            # link_tabby_payout_underlying_ids(). Not used for matching itself here.
+            "Order Numbers":"|".join(sorted(set(x for x in g["Order Number"].astype(str) if x and x!="nan"))),
             "Source File":source,
             "Source Row":int(g["Source Row"].min()),
         })
     return pd.DataFrame(rows)
+
+def link_tabby_payout_underlying_ids(provider_batches,matched):
+    """
+    V27: without this, a TABBY payout batch that settles to BANK RECEIVED has
+    no way to flip the underlying matched transaction's Bank Settled flag -
+    logic.bank_settlement_extension.propagate_verified_batches() only links a
+    batch back to matched via an explicit "Underlying IDs" list, or via a
+    Store+Terminal+Date+Payment fallback that only exists for ANB POS/AMEX.
+    TABBY payout batches don't carry a Store Code at all, so that fallback
+    cannot apply to them.
+
+    This resolves each batch's Order Numbers back to matched transactions via
+    "Provider Reference" (core.reconcile() already sets Provider Reference to
+    the TABBY Auth Code, which IS the Order Number - confirmed by
+    REGRESSION_PROVIDER_MATCHING_FINAL.py). Exactly like every other
+    auto-resolution rule in this codebase, a batch only gets linked when an
+    Order Number identifies exactly one matched transaction. Order Numbers
+    that don't resolve uniquely (zero or ambiguous matches) are silently
+    skipped - the batch still settles to BANK RECEIVED, it just carries no
+    Underlying IDs for that specific order, same as before this function
+    existed. Nothing here changes settlement status; it only makes propagation
+    possible for orders that already match unambiguously.
+
+    TAMARA and TAP are intentionally NOT covered here - their payout files
+    don't currently carry a per-transaction reference this codebase already
+    trusts elsewhere (TAP does have "authorization_id" in some exports, but
+    that has not been confirmed against how TAP Auth Codes land in `matched`).
+    Their batches settle to BANK RECEIVED exactly as before; they remain
+    unlinked to a specific matched transaction until that evidence exists.
+    """
+    if provider_batches is None or provider_batches.empty:
+        return provider_batches
+    out=provider_batches.copy()
+    if "Underlying IDs" not in out.columns:
+        out["Underlying IDs"]=""
+    if (
+        matched is None or matched.empty
+        or "Unique Transaction ID" not in matched.columns
+        or "Provider Reference" not in matched.columns
+        or "Order Numbers" not in out.columns
+    ):
+        return out
+
+    tabby_matched=matched[
+        matched.get("Payment Type","").astype(str).str.upper().eq("TABBY")
+        & matched["Provider Reference"].astype(str).ne("")
+    ].copy()
+    if tabby_matched.empty:
+        return out
+
+    ref_to_id={}
+    ambiguous=set()
+    for ref,g in tabby_matched.groupby(tabby_matched["Provider Reference"].astype(str)):
+        ids=sorted(set(g["Unique Transaction ID"].astype(str)))
+        if len(ids)==1:
+            ref_to_id[ref]=ids[0]
+        else:
+            ambiguous.add(ref)  # multiple matched transactions share this Order Number - never guess.
+
+    for idx,r in out.iterrows():
+        if str(r.get("Provider","")).upper()!="TABBY":
+            continue
+        orders=[o for o in str(r.get("Order Numbers","")).split("|") if o and o!="nan"]
+        linked=sorted({ref_to_id[o] for o in orders if o in ref_to_id and o not in ambiguous})
+        if linked:
+            existing=[x for x in str(r.get("Underlying IDs","")).split("|") if x and x!="nan"]
+            out.at[idx,"Underlying IDs"]="|".join(sorted(set(existing+linked)))
+    return out
 
 def normalize_tap_payout(df,source="TAP Payout"):
     d=norm_cols(df)
