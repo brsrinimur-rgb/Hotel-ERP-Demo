@@ -4,7 +4,6 @@ import streamlit as st
 import importlib
 import auth, theme, core, db
 from logic import bank_settlement_extension as bank_ext
-from logic import run_history
 import report_export
 
 # Reload current core.py from disk on each page run to avoid stale Streamlit module state.
@@ -71,20 +70,8 @@ prev_cf=st.file_uploader("Previous Carry Forward (optional)",type=["xlsx","xls",
 if st.button("RUN RECONCILIATION",type="primary",use_container_width=True):
     try:
         tender_parts=[];sales_details_parts=[];pos_parts=[];quarantine=[]
-        payout_sheets=set()  # V27: (file name, sheet name) pairs already routed to payout parsing below.
         for f in uploads or []:
             for sheet,df in core.read_upload(f).items():
-                # V27 de-dup guard: some files satisfy BOTH the filename-based provider
-                # detection (classify()/provider_signature(), e.g. "tap" in the file name)
-                # and the column-shape settlement-source detection (classify_settlement_source(),
-                # e.g. payout_id + settlement_id columns). When a sheet's columns match a
-                # provider payout/settlement report, it is a payout file, not a per-transaction
-                # export - route it only to the payout scan below and skip transaction-level
-                # classification entirely, so it is never normalized twice.
-                settlement_typ=core.classify_settlement_source(f.name,df)
-                if settlement_typ:
-                    payout_sheets.add((f.name,sheet))
-                    continue
                 typ=core.classify(f"{f.name}-{sheet}",df)
                 if typ=="D365 STORE TENDER":
                     tender_parts.append(core.normalize_tender(df))
@@ -168,10 +155,8 @@ if st.button("RUN RECONCILIATION",type="primary",use_container_width=True):
                     # ANB and Al Rajhi statement structures and preserves narration evidence.
                     b=bank_ext.normalize_bank_statement(df,f.name)
                     if b is None or b.empty:
-                        # Legacy parser remains as fallback. V27: pass source file/sheet
-                        # through so the legacy path stamps Bank Source Row/Sheet on every
-                        # row too, instead of relying only on the blanket stamp below.
-                        b=core.normalize_bank(df,bank,source_file=f.name,source_sheet=sheet)
+                        # Legacy parser remains as fallback.
+                        b=core.normalize_bank(df,bank)
                     if b is not None and not b.empty:
                         b["Bank Source File"]=f.name
                         b["Bank Source Sheet"]=sheet
@@ -193,9 +178,6 @@ if st.button("RUN RECONCILIATION",type="primary",use_container_width=True):
 
         # V26 additive provider-payout scan from the files already supplied to POS Reconciliation.
         # It does not replace the normal provider transaction parser.
-        # V27: files already routed into payout_sheets above (column-shape payout detection)
-        # were skipped by the transaction-level loop, so a given file/sheet is normalized
-        # exactly once - either as a transaction file or as a payout batch, never both.
         _all_for_payout=[]
         for _v in ["uploads","files","provider_uploads","pos_uploads"]:
             _obj=locals().get(_v)
@@ -226,10 +208,6 @@ if st.button("RUN RECONCILIATION",type="primary",use_container_width=True):
                 # Payout discovery must not break the proven reconciliation parser.
                 pass
         r_provider_batches=pd.concat(provider_payout_parts,ignore_index=True) if provider_payout_parts else pd.DataFrame()
-        # V27: resolve TABBY Order Numbers back to specific matched transactions before
-        # settlement matching, so a BANK RECEIVED payout batch can actually flip Bank Settled
-        # on the transaction it belongs to. See core.link_tabby_payout_underlying_ids().
-        r_provider_batches=core.link_tabby_payout_underlying_ids(r_provider_batches,matched)
 
         bank=pd.concat(banks,ignore_index=True) if banks else pd.DataFrame()
 
@@ -290,32 +268,7 @@ if st.button("RUN RECONCILIATION",type="primary",use_container_width=True):
                                     ) else pd.DataFrame(),
                                     "provider_payout_batches":r_provider_batches,
                                     "settlement_blocker_summary":bank_ext.settlement_blocker_summary(matched)}
-
-        # V28: every successful RUN RECONCILIATION creates a new, permanent Run ID and
-        # snapshots the full result under it. This never overwrites an older run - it only
-        # ever adds a new one. If run history storage itself has a problem, that must never
-        # block the live reconciliation result the user is looking at, so it's isolated in
-        # its own try/except.
-        try:
-            today_str=pd.Timestamp.today().strftime("%Y%m%d")
-            new_run_id=run_history.generate_run_id(today_str)
-            u=st.session_state.get("user") or {}
-            period_from=str(matched["Date"].min()) if not matched.empty and "Date" in matched.columns else ""
-            period_to=str(matched["Date"].max()) if not matched.empty and "Date" in matched.columns else ""
-            run_history.save_run(
-                new_run_id,st.session_state.ct_result,
-                created_at=pd.Timestamp.today().isoformat(),
-                username=u.get("username",""),user_name=u.get("name",""),
-                period_from=period_from,period_to=period_to,
-            )
-            st.session_state["current_run_id"]=new_run_id
-            st.success(f"Reconciliation completed and saved as {new_run_id}. Previous runs remain available on the Reconciliation Run History page.")
-        except Exception as run_history_error:
-            st.session_state.pop("current_run_id",None)
-            st.warning(
-                "Reconciliation completed, but it could not be saved to Run History "
-                f"({run_history_error}). The current session result above is unaffected."
-            )
+        st.success("Reconciliation completed and saved to the current control-tower session.")
     except Exception as e:
         st.exception(e)
 

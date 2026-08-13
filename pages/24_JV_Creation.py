@@ -53,8 +53,18 @@ scope=scope[(scope["_Date"]>=from_date)&(scope["_Date"]<=to_date)].copy()
 scope["_Matched"]=scope.get("Status","").astype(str).eq("Matched")
 scope["_Difference"]=pd.to_numeric(scope.get("Difference",0),errors="coerce")
 scope["_Tolerance_OK"]=scope["_Difference"].abs().le(1.0)
-scope["_Bank_Settled"]=scope.get("Bank Settled",False).fillna(False).astype(bool)
-scope["_Settlement_Stage"]=scope.get("Settlement Stage","").fillna("").astype(str)
+# Backward-compatible settlement fields:
+# Older reconciliation runs may not contain V24/V25 settlement columns.
+if "Bank Settled" in scope.columns:
+    scope["_Bank_Settled"]=scope["Bank Settled"].fillna(False).astype(bool)
+else:
+    scope["_Bank_Settled"]=pd.Series(False,index=scope.index,dtype=bool)
+
+if "Settlement Stage" in scope.columns:
+    scope["_Settlement_Stage"]=scope["Settlement Stage"].fillna("").astype(str)
+else:
+    scope["_Settlement_Stage"]=pd.Series("",index=scope.index,dtype="object")
+
 scope["_Ready"]=scope["_Matched"] & scope["_Tolerance_OK"] & scope["_Bank_Settled"]
 
 def _block_reason(row):
