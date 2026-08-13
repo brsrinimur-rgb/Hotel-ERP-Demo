@@ -1514,7 +1514,7 @@ def detect_bank_name(source,df=None):
     return "UNKNOWN"
 
 
-def normalize_bank(df,bank):
+def normalize_bank(df,bank,source_file="",source_sheet=""):
     d=norm_cols(df)
 
     dc=find(d,[
@@ -1554,8 +1554,17 @@ def normalize_bank(df,bank):
         "Bank":bank,
         "Bank Date":d[dc].apply(dt) if dc else pd.NaT,
         "Bank Amount":bank_amount,
-        "Description":d[desc].astype(str) if desc else ""
-    })
+        "Description":d[desc].astype(str) if desc else "",
+        "Bank Source File":source_file,
+        "Bank Source Sheet":source_sheet,
+    },index=d.index)
+    # V27: stamp a per-row source position so every legacy-parsed bank row gets
+    # a deterministic identity, matching the ANB/Al Rajhi parser in
+    # logic/bank_settlement_extension.py. Row numbers are 1-based and reflect
+    # this row's position in the original uploaded sheet (pre-filter), so a
+    # given physical row keeps the same Bank Source Row regardless of which
+    # other rows around it are dropped as blank/zero.
+    out["Bank Source Row"]=[i+1 for i in d.index]
 
     # Remove blank/zero/non-transaction rows.
     out=out[out["Bank Amount"].notna()].copy()
@@ -1779,8 +1788,17 @@ def _gl_event_type(description,amount_value):
 # =====================================================================
 
 def classify_settlement_source(name,df):
-    d=norm_cols(df)
-    cols=set(d.columns)
+    # V27 fix: this function's literal search terms ("payable to merchant",
+    # "payout_id", "transferred amount", ...) are lowercase/space-or-underscore
+    # separated, but norm_cols()/ccol() upper-cases every column and replaces
+    # separators with "_" (e.g. "Payout ID" -> "PAYOUT_ID"). Comparing those
+    # normalized columns against the lowercase literals below always failed,
+    # so this function silently returned "" for every real payout file and
+    # the entire Tabby/Tamara/TAP payout-matching path (both Settlement Batch
+    # Engine and, since V26, the main POS Reconciliation page) never actually
+    # fired. Use the raw column headers, only lowercased, so the existing
+    # literals match column names the way they were clearly written for.
+    cols={str(c).strip().lower() for c in df.columns}
     n=str(name or "").upper()
 
     # Tamara merchant statement / invoice payout file.
