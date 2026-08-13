@@ -3,6 +3,7 @@ import pandas as pd
 import streamlit as st
 import importlib
 import auth, theme, core, db
+from logic import bank_settlement_extension as bank_ext
 import report_export
 
 # Reload current core.py from disk on each page run to avoid stale Streamlit module state.
@@ -69,8 +70,20 @@ prev_cf=st.file_uploader("Previous Carry Forward (optional)",type=["xlsx","xls",
 if st.button("RUN RECONCILIATION",type="primary",use_container_width=True):
     try:
         tender_parts=[];sales_details_parts=[];pos_parts=[];quarantine=[]
+        payout_sheets=set()  # V27: (file name, sheet name) pairs already routed to payout parsing below.
         for f in uploads or []:
             for sheet,df in core.read_upload(f).items():
+                # V27 de-dup guard: some files satisfy BOTH the filename-based provider
+                # detection (classify()/provider_signature(), e.g. "tap" in the file name)
+                # and the column-shape settlement-source detection (classify_settlement_source(),
+                # e.g. payout_id + settlement_id columns). When a sheet's columns match a
+                # provider payout/settlement report, it is a payout file, not a per-transaction
+                # export - route it only to the payout scan below and skip transaction-level
+                # classification entirely, so it is never normalized twice.
+                settlement_typ=core.classify_settlement_source(f.name,df)
+                if settlement_typ:
+                    payout_sheets.add((f.name,sheet))
+                    continue
                 typ=core.classify(f"{f.name}-{sheet}",df)
                 if typ=="D365 STORE TENDER":
                     tender_parts.append(core.normalize_tender(df))
@@ -145,6 +158,7 @@ if st.button("RUN RECONCILIATION",type="primary",use_container_width=True):
         matched,us,up=core.reconcile(tender_for_pos,pos,tolerance)
         banks=[]
         bank_skipped=[]
+        provider_payout_parts=[]
         for f in bank_uploads or []:
             for sheet,df in core.read_upload(f).items():
                 bank="Al Rajhi Bank" if "rajhi" in f.name.lower() else "ANB Bank"
@@ -153,8 +167,10 @@ if st.button("RUN RECONCILIATION",type="primary",use_container_width=True):
                     # ANB and Al Rajhi statement structures and preserves narration evidence.
                     b=bank_ext.normalize_bank_statement(df,f.name)
                     if b is None or b.empty:
-                        # Legacy parser remains as fallback.
-                        b=core.normalize_bank(df,bank)
+                        # Legacy parser remains as fallback. V27: pass source file/sheet
+                        # through so the legacy path stamps Bank Source Row/Sheet on every
+                        # row too, instead of relying only on the blanket stamp below.
+                        b=core.normalize_bank(df,bank,source_file=f.name,source_sheet=sheet)
                     if b is not None and not b.empty:
                         b["Bank Source File"]=f.name
                         b["Bank Source Sheet"]=sheet
@@ -174,6 +190,42 @@ if st.button("RUN RECONCILIATION",type="primary",use_container_width=True):
                         "Reason":str(e)
                     })
 
+        # V26 additive provider-payout scan from the files already supplied to POS Reconciliation.
+        # It does not replace the normal provider transaction parser.
+        # V27: files already routed into payout_sheets above (column-shape payout detection)
+        # were skipped by the transaction-level loop, so a given file/sheet is normalized
+        # exactly once - either as a transaction file or as a payout batch, never both.
+        _all_for_payout=[]
+        for _v in ["uploads","files","provider_uploads","pos_uploads"]:
+            _obj=locals().get(_v)
+            if _obj:
+                try:
+                    _all_for_payout.extend(list(_obj) if isinstance(_obj,(list,tuple)) else [_obj])
+                except Exception:
+                    pass
+        _seen=set()
+        for _f in _all_for_payout:
+            _name=getattr(_f,"name",str(_f))
+            if _name in _seen:
+                continue
+            _seen.add(_name)
+            try:
+                for _sheet,_df in core.read_upload(_f).items():
+                    _typ=core.classify_settlement_source(_name,_df)
+                    _pb=pd.DataFrame()
+                    if _typ=="TAMARA_PAYOUT":
+                        _pb=core.normalize_tamara_payout(_df,_name)
+                    elif _typ=="TABBY_PAYOUT":
+                        _pb=core.normalize_tabby_payout(_df,_name)
+                    elif _typ=="TAP_PAYOUT":
+                        _pb=core.normalize_tap_payout(_df,_name)
+                    if _pb is not None and not _pb.empty:
+                        provider_payout_parts.append(_pb)
+            except Exception:
+                # Payout discovery must not break the proven reconciliation parser.
+                pass
+        r_provider_batches=pd.concat(provider_payout_parts,ignore_index=True) if provider_payout_parts else pd.DataFrame()
+
         bank=pd.concat(banks,ignore_index=True) if banks else pd.DataFrame()
 
         # Preserve the proven legacy transaction-level bank matching first.
@@ -183,10 +235,23 @@ if st.button("RUN RECONCILIATION",type="primary",use_container_width=True):
         # ANB card settlements are verified by terminal + source date + scheme + net amount,
         # then BANK RECEIVED is propagated to all underlying matched transactions.
         settlement_batches=core.build_card_settlement_batches(matched)
-        card_batch_result,card_bank_unmatched=bank_ext.reconcile_card_batches_to_anb(
+        card_batch_result,card_bank_unmatched=bank_ext.reconcile_card_batches_advanced(
             settlement_batches,bank,tolerance
         )
         matched=bank_ext.propagate_verified_batches(matched,card_batch_result)
+
+        # V26: provider payout settlement is also part of the main reconciliation path
+        # when provider payout batches are available. This removes the undocumented
+        # requirement to visit Settlement Batch Engine separately just to release
+        # Tabby/Tamara/TAP transactions to bank-settled status.
+        provider_batches=r_provider_batches if "r_provider_batches" in locals() else pd.DataFrame()
+        provider_batch_result=pd.DataFrame()
+        provider_bank_unmatched=pd.DataFrame()
+        if provider_batches is not None and not provider_batches.empty:
+            provider_batch_result,provider_bank_unmatched=bank_ext.reconcile_provider_batches_to_rajhi(
+                provider_batches,bank,tolerance,5.0
+            )
+            matched=bank_ext.propagate_verified_batches(matched,provider_batch_result)
 
         previous=None
         if prev_cf:
@@ -202,8 +267,23 @@ if st.button("RUN RECONCILIATION",type="primary",use_container_width=True):
                                     "cash_transactions":cash_transactions,
                                     "tender":tender,"sales_details":sales_details,"store613_bridge":store613_bridge,
                                     "pos":pos,"bank":bank,"quarantine":qdf,
-                                    "settlement_batches":card_batch_result,
-                                    "settlement_bank_unmatched":card_bank_unmatched,
+                                    "settlement_batches":pd.concat(
+                                        [x for x in [card_batch_result,provider_batch_result]
+                                         if x is not None and not x.empty],
+                                        ignore_index=True
+                                    ) if (
+                                        (card_batch_result is not None and not card_batch_result.empty)
+                                        or (provider_batch_result is not None and not provider_batch_result.empty)
+                                    ) else pd.DataFrame(),
+                                    "settlement_bank_unmatched":pd.concat(
+                                        [x for x in [card_bank_unmatched,provider_bank_unmatched]
+                                         if x is not None and not x.empty],
+                                        ignore_index=True
+                                    ) if (
+                                        (card_bank_unmatched is not None and not card_bank_unmatched.empty)
+                                        or (provider_bank_unmatched is not None and not provider_bank_unmatched.empty)
+                                    ) else pd.DataFrame(),
+                                    "provider_payout_batches":r_provider_batches,
                                     "settlement_blocker_summary":bank_ext.settlement_blocker_summary(matched)}
         st.success("Reconciliation completed and saved to the current control-tower session.")
     except Exception as e:
