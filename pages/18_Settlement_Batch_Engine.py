@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import auth, theme, core
 from logic import bank_settlement_extension as bank_ext
+from logic import run_history
 
 st.set_page_config(page_title="Settlement Batch Engine",layout="wide",page_icon="💰")
 auth.require_login({"Admin","Finance Manager","Finance Checker","Finance Maker"})
@@ -40,6 +41,14 @@ provider_files=st.file_uploader(
 
 tabby_fee=st.number_input("Tabby fixed payout-level deduction (SAR)",0.0,100.0,5.0,0.5)
 tol=st.number_input("Settlement-to-bank tolerance (SAR)",0.0,10.0,1.0,0.01)
+anb_lag=st.number_input(
+    "ANB settlement lag (days: POS transaction date -> bank narration date)",
+    0,5,1,1,
+    help="V29: proven against real July 2026 data - ANB books a terminal batch's bank credit "
+         "under the NEXT calendar day's narration date, not the same day. Default 1 matches the "
+         "confirmed real-data pattern (446/707 batches matched exactly with this offset vs 0 "
+         "with none). Change only if a different ANB statement cycle is observed."
+)
 
 if st.button("RUN SETTLEMENT BATCH CONTROL",type="primary",use_container_width=True):
     payout_parts=[]
@@ -81,13 +90,18 @@ if st.button("RUN SETTLEMENT BATCH CONTROL",type="primary",use_container_width=T
                 quarantine.append({"File":f.name,"Sheet":sheet,"Reason":str(e)})
 
     provider_batches=pd.concat(payout_parts,ignore_index=True) if payout_parts else pd.DataFrame()
+    # V27: without this, a TABBY payout batch that settles BANK RECEIVED below has no way to
+    # flip the underlying matched transaction's Bank Settled flag - propagate_verified_batches()
+    # only links via an explicit Underlying IDs list or a Store/Terminal/Date fallback that TABBY
+    # payout batches (no Store Code) cannot use. See core.link_tabby_payout_underlying_ids().
+    provider_batches=core.link_tabby_payout_underlying_ids(provider_batches,matched)
     all_batches=pd.concat([x for x in [card_batches,provider_batches] if x is not None and not x.empty],ignore_index=True) if (not card_batches.empty or not provider_batches.empty) else pd.DataFrame()
     bank=pd.concat(bank_parts,ignore_index=True) if bank_parts else r.get("bank",pd.DataFrame())
 
     # Run strong ANB card matching and provider/Al Rajhi payout matching separately,
     # then combine results. Legacy core matching remains available in core.py.
     card_result,anb_unmatched=bank_ext.reconcile_card_batches_advanced(
-        card_batches,bank,tol
+        card_batches,bank,tol,anb_lag
     )
     provider_result,rajhi_unmatched=bank_ext.reconcile_provider_batches_to_rajhi(
         provider_batches,bank,tol,tabby_fee
@@ -109,6 +123,18 @@ if st.button("RUN SETTLEMENT BATCH CONTROL",type="primary",use_container_width=T
     r["settlement_quarantine"]=pd.DataFrame(quarantine)
     r["settlement_stage_summary"]=core.settlement_stage_summary(updated)
     st.session_state["ct_result"]=r
+
+    # V28: this refines the CURRENT run's settlement data, so it re-saves under the SAME
+    # run_id captured when POS Reconciliation was last run (versioning that run's snapshot to
+    # its latest state) - it does not create a new run_id. If there's no current_run_id (e.g.
+    # this session predates Run History, or the initial save failed), settlement results still
+    # display normally; they just won't have a Run History entry to attach to.
+    run_id=st.session_state.get("current_run_id")
+    if run_id:
+        try:
+            run_history.save_run(run_id,r,created_at=pd.Timestamp.today().isoformat())
+        except Exception:
+            pass
 
     received=int((batch_result["Settlement Status"]=="BANK RECEIVED").sum()) if not batch_result.empty else 0
     pending=int((batch_result["Settlement Status"]=="BANK RECEIPT PENDING").sum()) if not batch_result.empty else 0
